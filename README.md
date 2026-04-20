@@ -8,9 +8,9 @@ Gallman et al. (in preparation). "Comparative single-cell RNA sequencing brain a
 
 ### Software
 
-* cellranger v9.0.1
-* cellbender v0.3.0
-* scanpy
+* [cellranger](https://www.10xgenomics.com/support/software/cell-ranger/latest) v9.0.1
+* [cellbender](https://github.com/broadinstitute/CellBender) v0.3.0
+* [scanpy](https://scanpy.readthedocs.io/en/stable/) v1.9.8
 
 ### Input files
 
