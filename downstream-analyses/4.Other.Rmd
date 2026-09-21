@@ -1,0 +1,3900 @@
+---
+title: "R Notebook"
+output: 
+  html_notebook: 
+    toc: true
+    theme: cerulean
+    number_sections: true
+---
+
+# . Environment
+## Load libraries
+```{r}
+#library(Matrix)
+
+#RNA seq specific
+library(Seurat)
+library(clustree)
+library(DESeq2)
+library(harmony)
+
+#plotting
+library(ggplot2)
+library(pheatmap)
+library(ggrepel) # label volcano
+library(scales)
+library(grid)
+
+#data management
+library(tibble)
+library(readr)
+library(stringr)
+library(dplyr)
+```
+
+## Load gene annotation maps
+```{r}
+# Extract GeneID to gene_symbol from NCBI genomic.gff
+gff_lines <- readLines("genomic.gff")
+gene_lines <- grep("\tgene\t", gff_lines, value = TRUE)
+
+extract_geneid_symbol <- function(attr) {
+  id <- sub(".*Dbxref=GeneID:([0-9]+).*", "\\1", attr)
+  symbol <- sub(".*;gene=([^;]+);.*", "\\1", attr)
+  data.frame(GeneID = id, gene_symbol = symbol)
+}
+
+gff_df <- do.call(rbind, lapply(gene_lines, function(line) {
+  fields <- strsplit(line, "\t")[[1]]
+  if (length(fields) >= 9) extract_geneid_symbol(fields[9]) else NULL
+}))
+
+gff_df$GeneID <- as.character(gff_df$GeneID)
+
+
+# Combine GFF and gene2ensembl mappings
+gene_map <- gff_df %>%
+  dplyr::distinct()
+
+## create separate map for manually labeled LOC genes
+loc_map <- c(
+  "103040661" = "her4.1", #radial glia
+  "103035120" = "gfap", #astrocytes/radial glia
+  "103034161" = "mpeg1", #macrophage/microglia
+  "125803969"= "mrc1b" #macrophage/microglia
+)
+
+## update map 
+# Make sure GeneID is character to match loc_map names
+gene_map$GeneID <- as.character(gene_map$GeneID)
+
+# Replace gene_symbol where GeneID matches your manual map
+gene_map$gene_symbol <- ifelse(
+  gene_map$GeneID %in% names(loc_map),
+  loc_map[gene_map$GeneID],
+  gene_map$gene_symbol
+)
+
+# Check results
+head(gene_map)
+```
+
+## define functions
+### Run binomial glm for composition stats
+Note: scCoda does not work well with low n data sets
+Binomial glm with dispersion and batch
+-Runs binomial with batch correction first, tests overdispersion vs overdisp_cut, if above threshold, uses beta-binomial for stats
+```{r}
+run_prop_glm_and_plot <- function(
+  denom_obj,
+  group_var = "idents",           # "idents" or metadata column in denom_obj
+  sample_col = "sample_id",
+  pop_col = "population",
+  batch_col = "batch",            # created from sample_id if missing
+  pop_ref = "surface",
+  pop_levels = c("surface", "cave"),
+  plot_percent = TRUE,
+  bar_error = c("sem", "sd", "none"),
+  overlay_points = TRUE,
+  point_jitter = 0.08,
+  fdr_cutoff = 0.05,
+  glm_family = c("auto", "betabinomial", "quasibinomial", "binomial"),
+  overdisp_cut = 1.2,
+  # ---- batch-driven overdispersion revert gate (AUTO only) ----
+  batch_revert = TRUE,
+  batch_revert_ratio = 0.6,       # if overdisp_with_batch <= ratio * overdisp_no_batch -> "mostly batch"
+  batch_revert_p = 0.05,          # batch must be supported by binomial LRT
+  batch_revert_overdisp_max = 1.5,# and residual overdisp w/ batch must be modest
+  order_levels = NULL,
+  strict_sum_to_one = TRUE
+) {
+  bar_error  <- match.arg(bar_error)
+  glm_family <- match.arg(glm_family)
+
+  suppressPackageStartupMessages({
+    library(Seurat)
+    library(dplyr)
+    library(tidyr)
+    library(ggplot2)
+    library(purrr)
+    library(broom)
+  })
+
+  md <- as.data.frame(denom_obj@meta.data)
+
+  if (!all(c(sample_col, pop_col) %in% colnames(md))) {
+    stop("Metadata must contain: ", paste(c(sample_col, pop_col), collapse = ", "))
+  }
+
+  # unwrap list columns (defensive)
+  for (v in c(sample_col, pop_col)) {
+    if (is.list(md[[v]])) md[[v]] <- vapply(md[[v]], \(x) as.character(x)[1], character(1))
+  }
+  if (!identical(group_var, "idents") && group_var %in% colnames(md) && is.list(md[[group_var]])) {
+    md[[group_var]] <- vapply(md[[group_var]], \(x) as.character(x)[1], character(1))
+  }
+
+  # factorize sample + population
+  md[[sample_col]] <- factor(md[[sample_col]])
+  md[[pop_col]]    <- stats::relevel(factor(md[[pop_col]], levels = pop_levels), ref = pop_ref)
+
+  # ============================================================
+  # Batch: derive from sample_id (underscore => batch2; else batch1)
+  # ============================================================
+  smp_chr <- as.character(md[[sample_col]])
+  md[[batch_col]] <- ifelse(grepl("_", smp_chr), "batch2", "batch1")
+  md[[batch_col]] <- factor(md[[batch_col]], levels = c("batch1", "batch2"))
+
+  # group labels from THIS SAME OBJECT
+  if (identical(group_var, "idents")) {
+    grp <- as.character(Idents(denom_obj))
+    default_levels <- levels(Idents(denom_obj))
+  } else {
+    if (!group_var %in% colnames(md)) stop("group_var not found in metadata: ", group_var)
+    grp <- as.character(md[[group_var]])
+    default_levels <- if (is.factor(md[[group_var]])) levels(md[[group_var]]) else unique(grp)
+  }
+
+  # enforce complete labeling (no silent dropping)
+  if (any(is.na(grp) | grp == "")) {
+    bad_n <- sum(is.na(grp) | grp == "")
+    stop(
+      "Found ", bad_n, " cells with NA/blank group labels in ", group_var, ".\n",
+      "Fix labels so proportions are well-defined."
+    )
+  }
+
+  md$.__group <- as.character(grp)
+
+  # determine plotting order
+  keep_levels <- if (!is.null(order_levels)) as.character(order_levels) else as.character(default_levels)
+  present <- unique(md$.__group)
+  if (!all(present %in% keep_levels)) keep_levels <- c(keep_levels, setdiff(present, keep_levels))
+  keep_levels <- keep_levels[keep_levels != "" & !is.na(keep_levels)]
+  md$.__group <- factor(md$.__group, levels = keep_levels)
+
+  # ============================================================
+  # 1) Per-sample counts and proportions
+  # ============================================================
+  totals <- md %>%
+    dplyr::group_by(.data[[sample_col]], .data[[pop_col]], .data[[batch_col]]) %>%
+    dplyr::summarise(total = dplyr::n(), .groups = "drop")
+
+  counts <- md %>%
+    dplyr::group_by(.data[[sample_col]], .data[[pop_col]], .data[[batch_col]], .__group) %>%
+    dplyr::summarise(count = dplyr::n(), .groups = "drop")
+
+  props_by_sample <- totals %>%
+    tidyr::expand_grid(.__group = factor(keep_levels, levels = keep_levels)) %>%
+    dplyr::left_join(counts, by = c(sample_col, pop_col, batch_col, ".__group")) %>%
+    dplyr::mutate(
+      count = ifelse(is.na(count), 0L, count),
+      non   = total - count,
+      prop  = count / total
+    )
+
+  if (any(props_by_sample$non < 0, na.rm = TRUE)) {
+    stop("Some group counts exceeded totals (should not happen with one input object).")
+  }
+
+  qc_sumprop <- props_by_sample %>%
+    dplyr::group_by(.data[[sample_col]], .data[[pop_col]], .data[[batch_col]]) %>%
+    dplyr::summarise(sum_prop = sum(prop), .groups = "drop")
+
+  if (isTRUE(strict_sum_to_one)) {
+    if (any(abs(qc_sumprop$sum_prop - 1) > 1e-6)) {
+      print(qc_sumprop)
+      stop(
+        "Proportions do not sum to 1 within at least one (sample, population, batch).\n",
+        "This indicates grouping does not partition all cells in the object."
+      )
+    }
+  }
+
+  # ============================================================
+  # 2) Bars + error bars across samples
+  # ============================================================
+  bar_df <- props_by_sample %>%
+    dplyr::group_by(.__group, .data[[pop_col]]) %>%
+    dplyr::summarise(
+      mean_prop = mean(prop, na.rm = TRUE),
+      sd_prop   = sd(prop, na.rm = TRUE),
+      n_samp    = dplyr::n(),
+      se_prop   = sd_prop / sqrt(n_samp),
+      .groups = "drop"
+    ) %>%
+    dplyr::mutate(
+      Var1 = factor(as.character(.__group), levels = keep_levels),
+      Var2 = factor(as.character(.data[[pop_col]]), levels = pop_levels)
+    )
+
+  cellprops <- bar_df %>% dplyr::transmute(Var1, Var2, Freq = mean_prop)
+
+  # ============================================================
+  # 3) Effects per group (population cave vs surface)
+  # ============================================================
+  pop_term <- paste0(pop_col, pop_levels[2])  # e.g. "populationcave"
+
+  # Robust beta-binomial fitter (tries multiple glmmTMBControl settings)
+  fit_bb_robust <- function(form, data) {
+    if (!requireNamespace("glmmTMB", quietly = TRUE)) {
+      stop("glm_family includes betabinomial but 'glmmTMB' is not installed.")
+    }
+
+    ctrl_list <- list(
+      glmmTMB::glmmTMBControl(),
+      glmmTMB::glmmTMBControl(
+        optimizer = stats::nlminb,
+        optCtrl = list(iter.max = 100000, eval.max = 100000)
+      ),
+      glmmTMB::glmmTMBControl(
+        optimizer = stats::optim,
+        optArgs = list(method = "BFGS"),
+        optCtrl = list(maxit = 100000)
+      )
+    )
+
+    fits <- vector("list", length(ctrl_list))
+    diags <- vector("list", length(ctrl_list))
+
+    for (i in seq_along(ctrl_list)) {
+      warn_msgs <- character(0)
+
+      fit_i <- tryCatch(
+        withCallingHandlers(
+          glmmTMB::glmmTMB(
+            form,
+            family = glmmTMB::betabinomial(link = "logit"),
+            data = data,
+            control = ctrl_list[[i]]
+          ),
+          warning = function(w) {
+            warn_msgs <<- c(warn_msgs, conditionMessage(w))
+            invokeRestart("muffleWarning")
+          }
+        ),
+        error = function(e) NULL
+      )
+
+      if (is.null(fit_i)) {
+        fits[[i]] <- NULL
+        diags[[i]] <- list(ok = FALSE, warn = "ERROR", conv = NA_integer_, pdHess = NA, aic = Inf)
+        next
+      }
+
+      conv_code <- tryCatch(fit_i$fit$convergence, error = function(e) NA_integer_)
+      pdHess    <- tryCatch(isTRUE(fit_i$sdr$pdHess), error = function(e) NA)
+      aic_val   <- tryCatch(stats::AIC(fit_i), error = function(e) Inf)
+
+      ok <- isTRUE(pdHess) && (!is.na(conv_code) && conv_code == 0)
+
+      fits[[i]] <- fit_i
+      diags[[i]] <- list(
+        ok = ok,
+        warn = if (length(warn_msgs) > 0) paste(unique(warn_msgs), collapse = " | ") else NA_character_,
+        conv = conv_code,
+        pdHess = pdHess,
+        aic = aic_val
+      )
+
+      if (ok) return(list(fit = fit_i, diag = diags[[i]]))
+    }
+
+    aic_vec <- vapply(diags, function(d) {
+      if (is.null(d) || is.null(d$aic) || !is.finite(d$aic)) Inf else d$aic
+    }, numeric(1))
+
+    if (all(is.infinite(aic_vec)) || all(vapply(fits, is.null, logical(1)))) {
+      return(list(
+        fit = NULL,
+        diag = list(ok = FALSE, warn = "ALL_FITS_FAILED", conv = NA_integer_, pdHess = NA, aic = Inf)
+      ))
+    }
+
+    best_i <- which.min(aic_vec)
+    list(fit = fits[[best_i]], diag = diags[[best_i]])
+  }
+
+  fit_and_tidy_one <- function(df_sub) {
+    form_full <- stats::as.formula(paste0("cbind(count, non) ~ ", pop_col, " + ", batch_col))
+
+    # ---- Always fit binomial baseline (for overdisp diagnostic + binomial output) ----
+    m_bin <- stats::glm(form_full, family = stats::binomial(), data = df_sub)
+    overdisp_bin <- m_bin$deviance / m_bin$df.residual
+
+    tidy_bin <- broom::tidy(m_bin) %>%
+      dplyr::filter(term == pop_term) %>%
+      dplyr::transmute(
+        term, estimate, std.error, statistic, p.value,
+        dispersion = 1,
+        overdisp   = overdisp_bin,
+        model_used = "binomial"
+      )
+
+    if (nrow(tidy_bin) == 0) {
+      tidy_bin <- dplyr::tibble(
+        term = pop_term, estimate = NA_real_, std.error = NA_real_,
+        statistic = NA_real_, p.value = NA_real_,
+        dispersion = 1, overdisp = overdisp_bin,
+        model_used = "binomial"
+      )
+    }
+
+    # If binomial explicitly requested -> return it
+    if (glm_family == "binomial") return(tidy_bin)
+
+    # Quasi helper (used for explicit quasi or auto fallback)
+    fit_quasi_row <- function(label = "quasibinomial") {
+      m_q <- stats::glm(form_full, family = stats::quasibinomial(), data = df_sub)
+      disp_q <- summary(m_q)$dispersion
+      over_q <- m_q$deviance / m_q$df.residual
+
+      td <- broom::tidy(m_q)
+      out <- td %>%
+        dplyr::filter(term == pop_term) %>%
+        dplyr::transmute(
+          term, estimate, std.error, statistic, p.value,
+          dispersion = disp_q,
+          overdisp   = over_q,
+          model_used = label
+        )
+
+      if (nrow(out) == 0) {
+        out <- dplyr::tibble(
+          term = pop_term, estimate = NA_real_, std.error = NA_real_,
+          statistic = NA_real_, p.value = NA_real_,
+          dispersion = disp_q, overdisp = over_q,
+          model_used = label
+        )
+      }
+      out
+    }
+
+    if (glm_family == "quasibinomial") return(fit_quasi_row("quasibinomial"))
+
+    # ============================================================
+    # AUTO-only "batch explains overdispersion" revert-to-binomial
+    # ============================================================
+    if (glm_family == "auto" && isTRUE(batch_revert)) {
+      form_nobatch <- stats::as.formula(paste0("cbind(count, non) ~ ", pop_col))
+      m_nobatch <- stats::glm(form_nobatch, family = stats::binomial(), data = df_sub)
+      overdisp_nobatch <- m_nobatch$deviance / m_nobatch$df.residual
+
+      lrt_b <- stats::anova(m_nobatch, m_bin, test = "Chisq")
+      p_batch <- NA_real_
+      pcol <- intersect(colnames(lrt_b), c("Pr(>Chi)", "Pr(>Chisq)"))
+      if (length(pcol) > 0) p_batch <- unname(lrt_b[[pcol[1]]][2])
+
+      ratio <- overdisp_bin / overdisp_nobatch
+
+      if (is.finite(overdisp_nobatch) && is.finite(overdisp_bin) && is.finite(ratio) &&
+          (overdisp_nobatch > overdisp_cut) &&
+          (ratio <= batch_revert_ratio) &&
+          (!is.na(p_batch) && p_batch < batch_revert_p) &&
+          (overdisp_bin <= batch_revert_overdisp_max)) {
+        tidy_bin$model_used <- "binomial_batch_explains"
+        return(tidy_bin)
+      }
+    }
+
+    # AUTO: if not meaningfully overdispersed, stick with binomial
+    if (glm_family == "auto" && is.finite(overdisp_bin) && overdisp_bin <= overdisp_cut) {
+      return(tidy_bin)
+    }
+
+    # From here: we want beta-binomial (explicit or auto when overdispersed)
+    if (!requireNamespace("glmmTMB", quietly = TRUE)) {
+      if (glm_family == "auto") return(fit_quasi_row("quasi_fallback"))
+      stop("glm_family='betabinomial' requires 'glmmTMB'. Install it with install.packages('glmmTMB').")
+    }
+
+    bb_full <- fit_bb_robust(form_full, df_sub)
+    m_full  <- bb_full$fit
+    d_full  <- bb_full$diag
+
+    # If beta cannot be fit, AUTO falls back to quasi; explicit beta returns NAs
+    if (is.null(m_full)) {
+      if (glm_family == "auto") {
+        out <- fit_quasi_row("quasi_fallback")
+        out$bb_conv   <- d_full$conv
+        out$bb_pdHess <- d_full$pdHess
+        out$bb_warn   <- d_full$warn
+        return(out)
+      }
+      return(dplyr::tibble(
+        term = pop_term, estimate = NA_real_, std.error = NA_real_,
+        statistic = NA_real_, p.value = NA_real_,
+        dispersion = NA_real_, overdisp = overdisp_bin,
+        model_used = "betabinomial_failed",
+        bb_conv = d_full$conv, bb_pdHess = d_full$pdHess, bb_warn = d_full$warn
+      ))
+    }
+
+    # ============================================================
+    # WALD inference for beta-binomial (matches binomial reporting)
+    # ============================================================
+    co <- summary(m_full)$coefficients$cond
+    co_pop <- co[rownames(co) == pop_term, , drop = FALSE]
+
+    est <- if (nrow(co_pop) == 1) unname(co_pop[1, "Estimate"]) else NA_real_
+    se  <- if (nrow(co_pop) == 1) unname(co_pop[1, "Std. Error"]) else NA_real_
+    z   <- if (nrow(co_pop) == 1 && "z value" %in% colnames(co_pop)) unname(co_pop[1, "z value"]) else NA_real_
+    p_w <- if (nrow(co_pop) == 1 && "Pr(>|z|)" %in% colnames(co_pop)) unname(co_pop[1, "Pr(>|z|)"]) else NA_real_
+
+    bb_sigma <- tryCatch(unname(stats::sigma(m_full)), error = function(e) NA_real_)
+
+    out <- dplyr::tibble(
+      term       = pop_term,
+      estimate   = est,
+      std.error  = se,
+      statistic  = z,
+      p.value    = p_w,
+      dispersion = bb_sigma,
+      overdisp   = overdisp_bin,
+      model_used = "betabinomial",
+      bb_conv    = d_full$conv,
+      bb_pdHess  = d_full$pdHess,
+      bb_warn    = d_full$warn
+    )
+
+    # Some fits can return NA Wald SE/p even if pdHess TRUE; AUTO falls back to quasi.
+    if (glm_family == "auto" && (!is.finite(out$std.error) || !is.finite(out$p.value))) {
+      qout <- fit_quasi_row("quasi_fallback")
+      qout$bb_conv   <- d_full$conv
+      qout$bb_pdHess <- d_full$pdHess
+      qout$bb_warn   <- d_full$warn
+      return(qout)
+    }
+
+    out
+  }
+
+  glm_effects <- props_by_sample %>%
+    dplyr::group_by(.__group) %>%
+    tidyr::nest() %>%
+    dplyr::mutate(tidy = purrr::map(data, fit_and_tidy_one)) %>%
+    dplyr::select(.__group, tidy) %>%
+    tidyr::unnest(tidy) %>%
+    {
+      if (!"bb_conv" %in% names(.)) {
+        .$bb_conv   <- NA_integer_
+        .$bb_pdHess <- NA
+        .$bb_warn   <- NA_character_
+      }
+      if (!"model_used" %in% names(.)) {
+        .$model_used <- NA_character_
+      }
+      .
+    } %>%
+    dplyr::mutate(
+      odds_ratio = exp(estimate),
+      p_adj = stats::p.adjust(p.value, "fdr"),
+      sig = ifelse(p_adj < fdr_cutoff, paste0("FDR < ", fdr_cutoff), "NS")
+    ) %>%
+    dplyr::transmute(
+      group = as.character(.__group),
+      term, estimate, std.error, statistic, p.value,
+      dispersion, overdisp,
+      p_adj, odds_ratio, sig,
+      model_used,
+      bb_conv, bb_pdHess, bb_warn
+    ) %>%
+    dplyr::arrange(p.value)
+
+  # ============================================================
+  # 4) Plot: bars + error bars + optional sample points
+  # ============================================================
+  ymult <- if (plot_percent) 100 else 1
+  ylab  <- if (plot_percent) "Percentage composition" else "Proportion composition"
+
+  p <- ggplot(cellprops, aes(fill = Var2, y = Freq * ymult, x = Var1)) +
+    geom_bar(position = position_dodge(width = 0.9), stat = "identity") +
+    theme_minimal() +
+    labs(x = "Cell type", y = ylab, fill = "population") +
+    scale_fill_manual(values = c("darkseagreen3", "palevioletred"))
+
+  if (bar_error != "none") {
+    p <- p +
+      geom_errorbar(
+        data = bar_df,
+        aes(
+          x = Var1,
+          ymin = (mean_prop - if (bar_error == "sem") se_prop else sd_prop) * ymult,
+          ymax = (mean_prop + if (bar_error == "sem") se_prop else sd_prop) * ymult,
+          group = Var2
+        ),
+        inherit.aes = FALSE,
+        color = "black",
+        linewidth = 0.4,
+        width = 0.25,
+        position = position_dodge(width = 0.9)
+      )
+  }
+
+  if (isTRUE(overlay_points)) {
+    p <- p +
+      geom_point(
+        data = props_by_sample %>%
+          dplyr::mutate(
+            Var1 = factor(as.character(.__group), levels = keep_levels),
+            Var2 = factor(as.character(.data[[pop_col]]), levels = pop_levels)
+          ),
+        aes(x = Var1, y = prop * ymult, fill = Var2),
+        inherit.aes = FALSE,
+        shape = 21,
+        color = "black",
+        size = 2,
+        alpha = 0.8,
+        position = position_jitterdodge(
+          jitter.width = point_jitter,
+          dodge.width  = 0.9
+        )
+      )
+  }
+
+  list(
+    plot_bar = p,
+    glm_effects = glm_effects,
+    props_by_sample = props_by_sample,
+    cellprops = cellprops,
+    bar_df = bar_df,
+    qc_sumprop = qc_sumprop,
+    glm_family = glm_family,
+    overdisp_cut = overdisp_cut
+  )
+}
+```
+
+### Pseudobulk DEGs 
+#### Annotation - DEGs across cell types
+```{r}
+deseq2_pb_annotation <- function(
+  cts,
+  coldata,
+  target_celltype,
+  ref_celltypes = NULL,
+  fdr_explore = 0.20,
+  min_total_count = 10,
+  min_samples = 2
+) {
+
+  stopifnot(is.matrix(cts) || inherits(cts, "dgCMatrix"))
+  stopifnot(all(c("col_id","sample","Population","CellType") %in% colnames(coldata)))
+
+  # clean coldata
+  coldata <- as.data.frame(coldata, stringsAsFactors = FALSE)
+  coldata$col_id     <- as.character(coldata$col_id)
+  coldata$sample     <- as.character(coldata$sample)
+  coldata$Population <- as.character(coldata$Population)
+  coldata$CellType   <- as.character(coldata$CellType)
+
+  # USE BOTH POPULATIONS for annotation (no subsetting)
+  cd <- coldata
+  if (nrow(cd) == 0) stop("coldata is empty after cleaning.")
+
+  # optionally restrict which “other” celltypes are allowed
+  if (!is.null(ref_celltypes)) {
+    keep_cts <- unique(c(ref_celltypes, target_celltype))
+    cd <- cd[cd$CellType %in% keep_cts, , drop = FALSE]
+    if (nrow(cd) == 0) stop("After ref_celltypes filtering, nothing left.")
+  }
+
+  # need at least some target samples
+  if (!any(cd$CellType == target_celltype)) {
+    stop("No pseudobulk columns for target celltype: ", target_celltype)
+  }
+
+  # align counts to cd
+  stopifnot(all(cd$col_id %in% colnames(cts)))
+  cts2 <- cts[, cd$col_id, drop = FALSE]
+
+  # define target vs other
+  cd$is_target <- ifelse(cd$CellType == target_celltype, "target", "other")
+  cd$is_target <- factor(cd$is_target, levels = c("other","target"))
+
+  # Prefilter genes: expressed in at least min_samples pseudobulk columns at >= min_total_count
+  keep <- Matrix::rowSums(cts2 >= min_total_count) >= min_samples
+  cts2 <- cts2[keep, , drop = FALSE]
+  if (nrow(cts2) == 0) stop("All genes filtered out; relax thresholds.")
+
+  # DESeq2 colData must match column order
+  cd2 <- cd[match(colnames(cts2), cd$col_id), , drop = FALSE]
+  stopifnot(identical(colnames(cts2), cd2$col_id))
+  rownames(cd2) <- cd2$col_id
+
+  # IMPORTANT: sample as a blocking factor (paired within sample)
+  cd2$sample    <- factor(cd2$sample)
+  cd2$is_target <- factor(cd2$is_target, levels = c("other","target"))
+
+  dds <- DESeq2::DESeqDataSetFromMatrix(
+    countData = round(cts2),
+    colData   = cd2,
+    design    = ~ sample + is_target
+  )
+
+  # sanity: need both target and other
+  if (length(unique(cd2$is_target)) < 2) {
+    stop("Need both target and other columns after filtering.")
+  }
+
+  dds <- DESeq2::DESeq(dds)
+
+  # results for target vs other
+  res <- DESeq2::results(
+    dds,
+    contrast = c("is_target","target","other"),
+    alpha = fdr_explore
+  ) |>
+    as.data.frame() |>
+    tibble::rownames_to_column("gene")
+
+  res_all <- res |>
+    dplyr::arrange(padj, dplyr::desc(baseMean))
+
+  res_sig <- res_all |>
+    dplyr::filter(!is.na(padj), padj < fdr_explore)
+
+  list(
+    dds             = dds,
+    res_sig         = res_sig,
+    res_all         = res_all,
+    target_celltype = target_celltype,
+    fdr_explore     = fdr_explore
+  )
+}
+```
+
+##### Export single cell type significant DEGs to csv
+```{r}
+format_and_write_annotation_csv <- function(
+  res_df,
+  neuro_cluster_label,          # e.g. "e2_tectum"
+  padj_cut = 0.05,
+  lfc_abs_min = 0,
+  top_n = 100,
+  drop_LOC = TRUE,
+  loc_regex = "^LOC",
+  extra_drop_regex = NULL
+) {
+
+  stopifnot(all(c("gene","padj","baseMean") %in% colnames(res_df)))
+
+  df <- res_df
+
+  # Optional filtering of LOC / unwanted symbols
+  if (drop_LOC) {
+    df <- df %>% filter(!grepl(loc_regex, gene))
+  }
+  if (!is.null(extra_drop_regex)) {
+    df <- df %>% filter(!grepl(extra_drop_regex, gene))
+  }
+
+  # Keep significant genes
+  df <- df %>% filter(!is.na(padj), padj <= padj_cut)
+
+  # Determine which LFC column to use
+  lfc_col <- if ("log2FoldChange_shrunk" %in% colnames(df)) {
+    "log2FoldChange_shrunk"
+  } else if ("log2FoldChange" %in% colnames(df)) {
+    "log2FoldChange"
+  } else {
+    stop("res_df must contain log2FoldChange or log2FoldChange_shrunk")
+  }
+
+  # Keep only TARGET-ENRICHED genes
+  df <- df %>% filter(.data[[lfc_col]] > 0)
+
+  # Optional LFC threshold
+  if (lfc_abs_min > 0) {
+    df <- df %>% filter(abs(.data[[lfc_col]]) >= lfc_abs_min)
+  }
+
+  # Add direction column (useful for sanity checks)
+  df <- df %>%
+    mutate(direction = "Up in target")
+
+  # Rank by: significance → specificity → expression
+  df_out <- df %>%
+    arrange(padj, desc(abs(.data[[lfc_col]])), desc(baseMean)) %>%
+    slice_head(n = top_n)
+
+  # Column order (clean CSV)
+  preferred <- c("gene","baseMean",lfc_col,"padj","pvalue","stat","lfcSE","direction")
+  keep_cols <- c(preferred, setdiff(colnames(df_out), preferred))
+  df_out <- df_out %>% select(any_of(keep_cols))
+
+  # Write directly to WORKING DIRECTORY
+  fname <- paste0(neuro_cluster_label, ".csv")
+  readr::write_csv(df_out, fname)
+
+  message("Wrote annotation DEG CSV to: ", normalizePath(fname))
+
+  return(df_out)
+}
+```
+
+##### Export all cell type markers with log2fold change cutoff
+```{r}
+run_all_celltype_deg_exports <- function(
+  cts,
+  coldata,
+  padj_cut = 0.05,
+  lfc_min = 1,
+  positive_only = TRUE,
+  out_csv = "AllCellTypes_DEGs_filtered.csv",
+  verbose = TRUE
+) {
+  suppressPackageStartupMessages({
+    library(dplyr)
+    library(readr)
+  })
+
+  stopifnot(is.matrix(cts) || inherits(cts, "dgCMatrix"))
+  stopifnot(all(c("col_id","sample","Population","CellType") %in% colnames(coldata)))
+
+  cd <- as.data.frame(coldata, stringsAsFactors = FALSE)
+  celltypes <- sort(unique(cd$CellType))
+  celltypes <- celltypes[!is.na(celltypes) & celltypes != ""]
+
+  if (length(celltypes) == 0) stop("No celltypes found in coldata.")
+
+  results_list <- vector("list", length(celltypes))
+  names(results_list) <- celltypes
+
+  failures <- list()
+
+  for (ct in celltypes) {
+    if (isTRUE(verbose)) message("Running DESeq2 for: ", ct)
+
+    out <- try(
+      deseq2_pb_annotation(
+        cts = cts,
+        coldata = cd,
+        target_celltype = ct
+      ),
+      silent = TRUE
+    )
+
+    if (inherits(out, "try-error")) {
+      failures[[ct]] <- as.character(out)
+      next
+    }
+
+    df <- out$res_all %>%
+      mutate(celltype = ct) %>%
+      select(celltype, gene, padj, log2FoldChange, lfcSE, pvalue, baseMean) %>%
+      filter(!is.na(padj), padj <= padj_cut) %>%
+      filter(!is.na(log2FoldChange))
+
+    if (positive_only) {
+      df <- df %>%
+        filter(log2FoldChange >= lfc_min)
+    } else {
+      df <- df %>%
+        filter(abs(log2FoldChange) >= lfc_min)
+    }
+
+    df <- df %>%
+      arrange(celltype, desc(log2FoldChange), padj, desc(baseMean))
+
+    results_list[[ct]] <- df
+  }
+
+  combined_results <- bind_rows(results_list)
+
+  readr::write_csv(combined_results, out_csv)
+
+  if (isTRUE(verbose)) {
+    message("Wrote filtered DEG file: ", normalizePath(out_csv))
+    if (length(failures) > 0) {
+      message("Some cell types failed. Check returned $failures.")
+    }
+  }
+
+  return(list(
+    degs = combined_results,
+    failures = failures
+  ))
+}
+```
+
+#### Population - subset to cell type for surface vs cave
+```{r}
+deseq2_pb_celltype <- function(cts, coldata, celltype,
+                               fdr_explore = 0.20,
+                               min_total_count = 10,
+                               min_samples = 2,
+                               shrink_type = c("apeglm", "ashr", "normal")) {
+
+  suppressPackageStartupMessages({
+    library(Matrix)
+    library(DESeq2)
+    library(dplyr)
+    library(tibble)
+  })
+
+  shrink_type <- match.arg(shrink_type)
+
+  stopifnot(is.matrix(cts) || inherits(cts, "dgCMatrix"))
+  stopifnot(all(c("col_id","sample","Population","CellType") %in% colnames(coldata)))
+
+  # Coerce to plain data.frame to avoid Rle/list columns breaking dplyr verbs
+  coldata <- as.data.frame(coldata, stringsAsFactors = FALSE)
+
+  coldata$col_id     <- as.character(coldata$col_id)
+  coldata$sample     <- as.character(coldata$sample)
+  coldata$Population <- as.character(coldata$Population)
+  coldata$CellType   <- as.character(coldata$CellType)
+
+  # Align count columns
+  stopifnot(all(coldata$col_id %in% colnames(cts)))
+  cts <- cts[, coldata$col_id, drop = FALSE]
+
+  # Subset to the requested cell type (already pseudobulked columns)
+  cd_ct <- coldata[coldata$CellType == celltype, , drop = FALSE]
+  if (nrow(cd_ct) == 0) stop("No pseudobulk samples for celltype: ", celltype)
+
+  cts_ct <- cts[, cd_ct$col_id, drop = FALSE]
+
+  # Prefilter genes
+  keep <- Matrix::rowSums(cts_ct >= min_total_count) >= min_samples
+  cts_ct <- cts_ct[keep, , drop = FALSE]
+  if (nrow(cts_ct) == 0) stop("All genes filtered out; relax thresholds.")
+
+  # Build DESeq2 colData and reorder to match columns
+  cd_ct2 <- unique(cd_ct[, c("col_id", "sample", "Population")])
+  cd_ct2 <- cd_ct2[match(colnames(cts_ct), cd_ct2$col_id), , drop = FALSE]
+  stopifnot(identical(colnames(cts_ct), cd_ct2$col_id))
+  rownames(cd_ct2) <- cd_ct2$col_id
+
+  # DESeq2
+  dds <- DESeqDataSetFromMatrix(
+    countData = round(cts_ct),
+    colData   = cd_ct2,
+    design    = ~ Population
+  )
+
+  dds$Population <- factor(dds$Population)
+  if (!("surface" %in% levels(dds$Population))) {
+    stop("Population must include 'surface'. Found: ", paste(levels(dds$Population), collapse = ", "))
+  }
+  if (length(levels(dds$Population)) != 2) {
+    stop("This function assumes exactly 2 Population levels. Found: ", paste(levels(dds$Population), collapse = ", "))
+  }
+
+  dds$Population <- relevel(dds$Population, ref = "surface")
+  dds <- DESeq(dds)
+
+  alt <- setdiff(levels(dds$Population), "surface")[1]
+  coef_name <- paste0("Population_", make.names(alt), "_vs_surface")
+  if (!coef_name %in% resultsNames(dds)) {
+    coef_name <- resultsNames(dds)[grepl("^Population_", resultsNames(dds))][1]
+  }
+
+  res <- results(dds, name = coef_name, alpha = fdr_explore) |>
+    as.data.frame() |>
+    tibble::rownames_to_column("gene")
+
+  res_shr <- tryCatch({
+    shr <- lfcShrink(dds, coef = coef_name, type = shrink_type)
+    as.data.frame(shr) |> tibble::rownames_to_column("gene")
+  }, error = function(e) {
+    shr <- lfcShrink(dds, coef = coef_name, type = "normal")
+    as.data.frame(shr) |> tibble::rownames_to_column("gene")
+  })
+
+  res_merged <- res |>
+    dplyr::left_join(
+      res_shr |> dplyr::select(gene, log2FoldChange) |> dplyr::rename(log2FoldChange_shrunk = log2FoldChange),
+      by = "gene"
+    ) |>
+    dplyr::arrange(padj, dplyr::desc(abs(log2FoldChange_shrunk)))
+
+  res_celltype <- res_merged |>
+    dplyr::filter(!is.na(padj), padj < fdr_explore)
+
+  list(
+    dds          = dds,
+    res_celltype = res_celltype,
+    res_all      = res_merged,
+    celltype     = celltype,
+    coef_name    = coef_name,
+    fdr_explore  = fdr_explore
+  )
+}
+```
+### Plotting
+```{r}
+mini_axis_umap <- function(
+  seurat_obj,
+  reduction = "umap",
+  group.by = NULL,
+  split.by = NULL,
+  label = TRUE,
+  shuffle = TRUE,
+  alpha = 0.8,
+  pt.size = 0.5,
+  axis_frac = 0.08,
+  pad_frac  = 0.03,
+  arrow_mm  = 2,
+  linewidth = 0.5,
+  add_labels = TRUE,
+  label_x = "UMAP 1",
+  label_y = "UMAP 2",
+  label_size = 3,
+  margin_mm = 5.5,
+  seed = NULL
+) {
+  stopifnot(inherits(seurat_obj, "Seurat"))
+
+  if (!is.null(seed)) set.seed(seed)
+
+  # 1) Base DimPlot
+  p <- DimPlot(
+    seurat_obj,
+    reduction = reduction,
+    group.by = group.by,
+    split.by = split.by,
+    label = label,
+    shuffle = shuffle,
+    alpha = alpha,
+    pt.size = pt.size
+  ) + NoLegend()
+
+  # 2) Remove axes completely
+  p_clean <- p +
+    theme_void() +
+    theme(plot.margin = margin(margin_mm, margin_mm, margin_mm, margin_mm, unit = "mm")) +
+    NoLegend()
+
+  # 3) Compute panel ranges
+  gb <- ggplot_build(p_clean)
+  pp <- gb$layout$panel_params[[1]]
+  x_rng <- pp$x.range
+  y_rng <- pp$y.range
+
+  x_span <- diff(x_rng)
+  y_span <- diff(y_rng)
+
+  # Bottom-left corner position (with padding)
+  x0 <- x_rng[1] + pad_frac * x_span
+  y0 <- y_rng[1] + pad_frac * y_span
+
+  # Mini-axis lengths
+  dx <- axis_frac * x_span
+  dy <- axis_frac * y_span
+
+  # 4) Add mini-axes + optional labels
+  p_final <- p_clean +
+    annotate(
+      "segment",
+      x = x0, xend = x0 + dx,
+      y = y0, yend = y0,
+      linewidth = linewidth,
+      arrow = arrow(type = "closed", length = unit(arrow_mm, "mm"))
+    ) +
+    annotate(
+      "segment",
+      x = x0, xend = x0,
+      y = y0, yend = y0 + dy,
+      linewidth = linewidth,
+      arrow = arrow(type = "closed", length = unit(arrow_mm, "mm"))
+    )
+
+  if (isTRUE(add_labels)) {
+    p_final <- p_final +
+      annotate(
+        "text",
+        x = x0 + dx, y = y0 - 0.01 * y_span,
+        label = label_x, hjust = 1, vjust = 1, size = label_size
+      ) +
+      annotate(
+        "text",
+        x = x0 - 0.01 * x_span, y = y0 + dy,
+        label = label_y, hjust = 1, vjust = 1, angle = 90, size = label_size
+      )
+  }
+
+  return(p_final)
+}
+```
+
+# . Data 
+load either full brain data set to subset or load subset
+```{r}
+#lSeq <- readRDS("lSeq.rds")
+lSeqNon <- readRDS("lSeqNon.rds")
+```
+
+# . Subset
+```{r}
+#lSeqNon <- subset(x = lSeq, idents = "Other")
+```
+
+## Reprocess subset
+```{r}
+# lSeqNon <- FindNeighbors(lSeqNon, dims = 1:30, reduction = "harmony")
+# lSeqNon <- FindClusters(lSeqNon, resolution =c(0.75))
+# 
+# #lSeqNon <- FindClusters(lSeqNon, resolution =c(0.25, 0.5, 0.75))
+```
+
+```{r}
+# #clustering tree
+# clustree(lSeqNon@meta.data, prefix = "originalexp_snn_res.0", exprs = "data", node_colour = "sc3_stability",  
+#         node_text_colour = "white",show_axis=TRUE) + theme(legend.position = "bottom")
+#choose resolution according to clustree
+#Idents(lSeqNon)<- lSeqNon@meta.data[["originalexp_snn_res.0.75"]]
+```
+
+```{r}
+#lSeqNon <- RunUMAP(lSeqNon, dims = 1:30, reduction = "harmony")
+```
+
+```{r}
+#DimPlot acording to cluster identity
+DimPlot(object = (lSeqNon),label=TRUE,  pt.size = 0.25) +
+  theme(axis.title.x=element_text(size=12),
+        axis.title.y=element_text(size=12))
+```
+# . Annotate
+## define object
+```{r}
+lSeqNonLB <- lSeqNon
+# Named vector for relabeling clusters
+cluster_labels <- data.frame(
+  cluster = 0:24,
+  celltype = c(
+    "b1", #0 "Miningeal fibro"
+    "b2",  #1 "BBB endothelium"
+    "p1", #2 "Vascular endothelial (lymphatic)"
+    "b3", #3 "mLECs"
+    "p2", #4  "Surface epithelium"
+    "p3", #5 "Branchiomeric muscle"
+    "p4", #6 "Basal keratinocytes"
+    "p5", #7 "Erythrocytes"
+    "p6", #8 "Chondrocytes"
+    "b1", #9 "Miningeal fibro"
+    "p6", #10 "Chondrocytes"
+    "p7", #11 "Olfactory sensory neurons"
+     "p8", #12 "Skeletal muscle"
+    "p9", #13 "Hair cell epithelium"
+    "b4",  #14 "Mural Cells"
+    "p10", #15 "Otic sensory epithelium"
+     "p11", #16 "Schwann Cells"
+     "p12", #17 "Pituitary endocrine"
+    "b5", #18 "Pineal epithelium"
+    "b6", #19 "Choroid plexus epithelium"
+    "p13", #20 "Epibranchial Visceral Sensory Neurons"
+    "b7", #21 "Pineal Photoreceptors"
+    "p5", #22  "Erythrocytes"
+    "p15",  #23 "Mechanosensory hair cells"
+    "p14" #24 "Hepatocytes"
+  )
+)
+
+# Convert Idents to numeric or character to match cluster_labels
+cluster_ids <- as.numeric(as.character(Idents(lSeqNonLB)))
+
+# Join the labels
+lSeqNonLB$celltype <- cluster_labels$celltype[match(cluster_ids, cluster_labels$cluster)]
+Idents(lSeqNonLB) <- lSeqNonLB$celltype
+
+
+Idents(lSeqNonLB) <- factor(
+  Idents(lSeqNonLB),
+  levels = c("b1","b2","b3","b4","b5","b6","b7","p1", "p2", "p3", "p4", "p5", "p6", "p7", "p8", "p9", "p10", "p11", "p12", "p13", "p14", "p15")
+)
+```
+## plot umap
+```{r}
+mini_axis_umap(
+  lSeqNonLB,
+  reduction = "umap",
+  group.by = NULL,
+  split.by = NULL,
+  label = TRUE,
+  shuffle = TRUE,
+  alpha = 0.8,
+  pt.size = 0.5,
+  axis_frac = 0.08,
+  pad_frac  = 0.03,
+  arrow_mm  = 2,
+  linewidth = 0.5,
+  add_labels = TRUE,
+  label_x = "UMAP 1",
+  label_y = "UMAP 2",
+  label_size = 3,
+  margin_mm = 5.5,
+  seed = NULL
+)
+
+#ggsave("lSeqNonLBcords.pdf", width = 10, height = 8, dpi = 300)
+
+```
+
+## Calculate DEGs
+```{r}
+pb <- AggregateExpression(
+  lSeqNonLB,
+  assays        = "RNA",
+  slot          = "counts",
+  group.by      = c("population", "sample_id", "celltype"),
+  return.seurat = TRUE
+)
+
+cts <- GetAssayData(pb, assay = "RNA", layer = "counts")
+
+coldata <- pb@meta.data %>%
+  tibble::rownames_to_column("col_id") %>%     # rownames are the pseudo-bulk column IDs
+  transmute(
+    col_id     = col_id,
+    sample     = sample_id,
+    Population = factor(population, levels = c("surface", "cave")),
+    CellType   = celltype
+  )
+```
+
+### all degs
+```{r}
+res <- run_all_celltype_deg_exports(
+  cts = cts,
+  coldata = coldata,
+  padj_cut = 0.05,
+  lfc_min = 0.5,
+  positive_only = TRUE,
+  out_csv = "ST7_OtherCellTypes_MarkerDEGs.csv"
+)
+```
+
+### degs by cluster
+```{r}
+res <- deseq2_pb_annotation(
+  cts              = cts,     # pseudobulk count matrix (genes x columns)
+  coldata          = coldata,     # pseudobulk metadata
+  target_celltype  = "p15"          
+)
+
+format_and_write_annotation_csv(
+  res_df = res$res_all,
+  neuro_cluster_label = "NonP15",
+  padj_cut = 0.05,
+  top_n = 500
+)
+```
+
+## Annotate brain clusters
+### b1: Meningeal fibroblasts
+
+Cluster b1: Meningeal fibroblasts
+
+One-line identity: Collagen-rich cranial mesenchyme–derived meningeal fibroblasts, most consistent with leptomeningeal/pial–arachnoid stromal cells that specialize in extracellular matrix production, matrix remodeling, and local morphogen signaling rather than neural, vascular, or immune identity. This interpretation is supported by the combination of strong fibrillar/ECM collagen expression, a pdgfra+ fibroblast program, cranial mesenchyme transcription factors, and stromal signaling genes that fit zebrafish fibroblast and meningeal-associated support populations (Banerjee et al., 2022; Dee et al., 2013; Eberhart et al., 2006; Lendahl et al., 2022; Psutkova et al., 2025; Rajan et al., 2020).  
+ 
+Key evidence
+• Definitive fibroblast / ECM-producing stromal program:
+col12a1a, col12a1b, col11a1b, col11a2, col5a1, col5a2a, col6a1, col6a2, col1a1b, col22a1, col23a1a, col27a1a, hapln1a, tncb, tnca, vcana, fbn1, fbn2b, mfap2, tgfbi, mmp14a, adamts17, adamts18
+→ The dominant signal is a matrix-secreting connective-tissue phenotype rather than glial or endothelial identity. In zebrafish, fibroblast populations are defined by strong collagen/ECM expression, and recent single-cell work also emphasizes broad fibroblast heterogeneity with distinct matrix-producing subtypes. The prominence of multiple fibrillar collagens, proteoglycan-associated ECM genes, and matrix-remodeling enzymes strongly supports annotation as fibroblasts.  
+
+• pdgfra mesenchymal fibroblast identity:
+pdgfra, itga11a, cdh11, myh10, plpp3, scara5
+→ pdgfra is one of the strongest anchors for this annotation. Zebrafish studies identify pdgfra-expressing cells as fibroblast as well as fibroblast precursors that migrate and diversify into fibroblast subtypes. The additional presence of itga11a and cdh11 further supports a mesenchymal fibroblast interpretation rather than meningeal endothelium or mural cells.  
+
+• Cranial mesenchyme / meningeal connective-tissue patterning program:
+alx4a, meis1a, gli2b, glis2a, nfatc4, runx2b, twist-like mesenchymal context from your broader marker set
+→ This cluster carries a cranial mesenchyme-like regulatory profile. In zebrafish, twist1 is expressed in craniofacial/head mesenchyme and alx4a is expressed in craniofacial/frontonasal mesenchyme and connective-tissue lineages. This makes the DEG combination more consistent with cranial meningeal / head-associated fibroblastic mesenchyme than with peripheral connective tissue.  
+• Stromal signaling and morphogen-organizing niche features:
+wnt5a, wnt5b, rspo2, ntn1a, boc, cdon, ptch1, tgfbi
+→ These genes suggest that the cells are not merely structural ECM producers; they likely contribute to a local signaling niche. Fibroblast populations are functionally diverse and can act as signaling-organizing stromal cells, while leptomeningeal support populations in zebrafish also participate in local brain-surface vascular and stromal organization. 
+
+**Decision rule:**
+
+The combined presence of a strong collagen- and proteoglycan-rich ECM program, pdgfra-positive fibroblast identity, cranial mesenchymal transcription factors, and stromal morphogen/signaling genes supports annotation as meningeal fibroblasts. The profile is more consistent with brain-surface connective tissue of meningeal origin than with mural cells, endothelial cells, glia, or neural crest–derived neurons.  
+
+**Distinguishing note:**
+
+This cluster is distinguished from mural/perivascular cells by its much stronger fibrillar collagen and matrix-remodeling profile, from cartilage/osteogenic mesenchyme by the lack of a dominant chondrocyte or osteoblast program, and from CNS glia by the absence of canonical glial transport/homeostasis markers. What stands out most is a pdgfra cranial fibroblast identity coupled to heavy ECM deposition, which is exactly the kind of profile expected for meningeal fibroblasts associated with pia/arachnoid connective tissue. 
+
+
+```{r}
+DotPlot(lSeqNonLB, features = c(
+  
+    # Fibroblast / ECM-producing stromal program
+    "col12a1a", "col12a1b", "col11a1b", "col11a2",
+    "col5a1", "col5a2a", "col6a1", "col6a2",
+    "col1a1b", "col22a1", "col23a1a", "col27a1a",
+    "hapln1a", "tncb", "tnca", "vcana", "fbn1", "fbn2b",
+    "mfap2", "tgfbi", "mmp14a", "adamts17", "adamts18",
+
+    # pdgfra mesenchymal fibroblast identity
+    "pdgfra", "itga11a", "cdh11", "myh10", "plpp3", "scara5",
+
+    # Cranial mesenchyme / meningeal patterning
+    "alx4a", "meis1a", "gli2b", "glis2a", "nfatc4", "runx2b",
+
+    # Stromal signaling / morphogen niche
+    "wnt5a", "wnt5b", "rspo2", "ntn1a", "boc", "cdon", "ptch1"
+    
+  )
+) + RotatedAxis()
+```
+
+
+### b2: BBB
+
+**Cluster b2: Brain endothelium / BBB-like**
+
+One-line identity: Arterial-leaning brain endothelial cells with a strong BBB-like barrier and transporter program, defined by a canonical endothelial/vascular core together with cldn5a- and slc2a1a-linked barrier features, brain-enriched solute transporters, and arterial Notch signaling, consistent with zebrafish cerebrovascular endothelium specialized for blood-brain barrier function rather than tip-like angiogenic, lymphatic, or fenestrated vascular states (Hasan et al., 2017; Hotz et al., 2021; Li et al., 2022; Quiñonez-Silvero et al., 2020; Zheng et al., 2010).  
+ 
+
+**Key evidence**
+
+  • Definitive endothelial / cerebrovascular identity: pecam1b, cdh5, tie1, kdr, kdrl, flt1, ptprb, egfl7, esama, plxnd1, nrp1b, pcdh12
+    → The combination of VE-cadherin/cdh5, PECAM, VEGFR/kdr-kdrl, Tie, ptprb, egfl7, and esama is a classic vascular endothelial program and
+    zebrafish brain-vasculature work specifically places these genes within developing cerebrovascular endothelium rather than mural, meningeal,
+    or glial populations.  
+ 
+  • BBB-like barrier and junction program: cldn5a, cgnl1, jam2a, clic2, tmem204, rasip1, heg1
+    → Cldn5a is required for proper BBB function, and BBB maturation studies also emphasize endothelial junctional specialization and
+    suppression of non-barrier permeability mechanisms as key features of brain endothelial identity.  
+
+  • Brain-endothelial transporter / metabolic specialization: slc2a1a, slc38a5b, slco4a1, slco1c1, slco2a1, slc7a5, slc7a3a, slc31a1, abcb4,
+  abcc4, abcg2a, scarb2a, scarb2b
+    → Slc2a1a/GLUT1 is a canonical BBB-associated transporter and the broader enrichment of nutrient, solute, and efflux transport systems fits
+    a metabolically selective brain endothelial state. Abcb4 and BBB-associated ABC transport activity is also part of a specialized endothelial
+    barrier program in zebrafish.  
+ 
+  • Arterial-leaning endothelial specification: dll4, kdrl, kdr, flt1, klf2a, epas1a, erg, mef2aa, tbx3a, acvrl1, eng
+    → This cluster is not just BBB-like; it is also arterial-biased. Endothelial Notch signaling studies directly link dll4/Notch to artery
+    formation and restriction of angiogenic behavior. The accompanying flow/shear and endothelial TF module (klf2a, erg, epas1a, mef2aa)
+    reinforces an arterial cerebrovascular identity rather than venous or lymphatic endothelium.  
+
+**Decision rule:**
+
+The combined presence of a definitive endothelial core, a strong cldn5a/slc2a1a BBB-like barrier and transporter program, and a dll4/arterial signaling axis supports annotation as brain endothelium / BBB-like, arterial-biased.  
+
+**Distinguishing note:**
+
+This cluster is distinguished from more angiogenic endothelial states by its stronger barrier/junction and transporter specialization, from lymphatic endothelium by the lack of a convincing lymphatic marker set, and from fenestrated endothelium by its BBB-associated cldn5a and slc2a1a profile. 
+
+```{r}
+DotPlot(lSeqNonLB, features = c(
+
+    # Definitive endothelial / cerebrovascular identity
+    "pecam1b", "cdh5", "tie1", "kdr", "kdrl", "flt1",
+    "ptprb", "egfl7", "esama", "plxnd1", "nrp1b", "pcdh12",
+
+    # BBB-like barrier and junction program
+    "cldn5a", "cgnl1", "jam2a", "clic2",
+    "tmem204", "rasip1", "heg1",
+
+    # Brain-endothelial transporter / metabolic specialization
+    "slc2a1a", "slc38a5b", "slco4a1", "slco1c1",
+    "slco2a1", "slc7a5", "slc7a3a", "slc31a1",
+    "abcb4", "abcc4", "abcg2a", "scarb2a", "scarb2b",
+
+    # Arterial-leaning endothelial specification
+    "dll4", "klf2a", "epas1a", "erg",
+    "mef2aa", "tbx3a", "acvrl1", "eng"
+
+  )
+) + RotatedAxis()
+```
+
+
+### b3: mLSCs
+
+**Cluster b3: mLSCs (meningeal lymphatic supporting cells)**
+
+One-line identity: Non-endothelial leptomeningeal support cells consistent with the zebrafish mLSC state described by He et al. 2024, defined by epd together with pro-lymphangiogenic support genes, basement-membrane / ECM components, metabolite and lipid transporters, and a meningeal mesenchymal transcriptional program, consistent with cells that wrap and support muLECs and adjacent meningeal blood vessels rather than forming lymphatic endothelium themselves (Grimm et al., 2023; He et al., 2024; Jha et al., 2017; Le Guen et al., 2014; Uphoff et al., 2026).  
+ 
+**Key evidence**
+
+  • Definitive mLSC-support-cell identity: epd, ccbe1, vegfc, pdgfra, ramp2, lamc3, flvcr2b, apof, slc38a4, vcam1b
+   → mLSCs described in He et al. 2024 are specifically epd-positive, form membranous leptomeningeal structures, and wrap most leptomeningeal
+   blood vessels. 
+ 
+  • Pro-lymphangiogenic support program rather than lymphatic endothelial identity: ccbe1, vegfc, ramp2, pdgfra, bmp7b, gas6, pros1
+   → These genes fit a supportive niche for meningeal lymphatic cells, not a mature LEC identity. mLECs depend on the Vegfc–Vegfd–Ccbe1 pathway
+   for development and act as upstream as the supportive meningeal cell type that helps drive muLEC development, maintenance, and regeneration. 
+  
+  • Basement membrane / meningeal ECM scaffold: nid1a, lamc3, col4a5, lama2, col18a1a, mmp14b, loxl1, emilin1b, vcam1b
+   → This cluster is rich in extracellular-matrix and basement-membrane genes, which fits the structural role of mLSCs that act as
+   membrane-forming leptomeningeal support cells. The strong laminin/collagen/nidogen/LOX signal argues that these are stromal wrapping cells
+   building or maintaining the local meningeal matrix around vessels and muLECs.  
+  
+  • Metabolic / lipid / solute support module: flvcr2b, apof, slc38a4, slc20a2, slc7a2, slc7a8a, slc13a3, slc13a5a, abca1b, glula, glulb
+   → mLSCs are transporter-rich and metabolically supportive, with multiple solute carriers plus lipid-handling genes such as apof and abca1b.  
+ 
+  • Meningeal mesenchymal / stromal transcriptional program: foxp1a, foxp1b, alx4a, glis2a, gli1, zic2a, zic4
+   → This TF module supports a specialized meningeal stromal identity layered onto the lymphatic-support phenotype.  
+
+  • Distinguished from muLECs and blood endothelial cells:
+   → lack of a canonical lymphatic endothelial core such as prox1a, lyve1b, flt4/vegfr3, and mrc1a, and lack of a blood endothelial core such as
+   kdrl, cdh5, and pecam1 among DEGs.
+
+**Decision rule:**
+
+The combined presence of epd, a Vegfc/Ccbe1-linked lymphangiogenic support module, strong meningeal ECM/basement-membrane genes, abundant solute and lipid transporters, and absence of a defining endothelial identity supports annotation as mLSCs.
+
+**Distinguishing note:**
+
+This cluster lacks the canonical lymphatic endothelial program of muLECs as well as the core vascular endothelial signature of brain endothelium. Compared with more generic fibroblast-like meningeal stromal cells, it is specifically marked by the epd + pro-lymphangiogenic support profile defined as mLSCs in He et al. 2024.  
+
+```{r}
+DotPlot(lSeqNonLB, features = c(
+
+    # mLSC support-cell identity
+    "epd", "ccbe1", "vegfc", "pdgfra", "ramp2",
+    "lamc3", "flvcr2b", "apof", "slc38a4", "vcam1b",
+
+    # Pro-lymphangiogenic support program
+    "bmp7b", "gas6", "pros1",
+
+    # Basement membrane / meningeal ECM scaffold
+    "nid1a", "col4a5", "lama2", "col18a1a",
+    "mmp14b", "loxl1", "emilin1b",
+
+    # Metabolic / lipid / solute support module
+    "slc20a2", "slc7a2", "slc7a8a",
+    "slc13a3", "slc13a5a", "abca1b",
+    "glula", "glulb",
+
+    # Meningeal mesenchymal / stromal TF program
+    "foxp1a", "foxp1b", "alx4a",
+    "glis2a", "gli1", "zic2a", "zic4"
+
+  )
+) + RotatedAxis()
+```
+
+
+### b4: Mural cells
+
+**Cluster b4: Mixed mural cells (pericyte + vascular smooth muscle continuum)**
+
+One-line identity: Mixed mural cell population exhibiting both pericyte (pdgfrb/rgs5) and contractile smooth muscle (acta2/tagln/myh11a) programs, consistent with a pericyte–vSMC continuum (Ando et al., 2021; Colijn et al., 2024; Leonard et al., 2022; Ryu et al., 2022; Shih et al., 2021; Whitesell et al., 2019; Zi et al., 2024).
+ 
+**Key evidence**
+
+• Core mural-cell identity (shared perivascular lineage): pdgfrb, rgs5a, mcamb, cd248a, notch3
+→ These genes define canonical vascular mural cells in zebrafish, marking cells that physically associate with and stabilize blood vessels. pdgfrb signaling is required for mural-cell recruitment, while rgs5 is a widely used pericyte/mural marker. The presence of notch3 further supports mural identity linked to vessel wall differentiation.
+
+• Pericyte-associated program: pdgfrb, rgs5a, rgs12b, cd248a, mcam/mcamb, gpr4, ndufa4l2a, kcne4
+→ These genes are classically enriched in pericytes, particularly capillary-associated mural cells involved in endothelial interaction, vessel stabilization, and signaling. This component indicates a clear pericyte-like identity within the cluster rather than purely smooth muscle cells.
+
+• Contractile smooth muscle (vSMC-like) program: acta2, tagln, myh11a, mylkb, mylka, myl9b, tpm1, tpm4a,
+tpm4b, cald1a, myocd, lmod1b
+→ This is a robust actomyosin contractile machinery, characteristic of vascular smooth muscle cells. Genes such as acta2, tagln, and myh11a define differentiated vSMCs, while myocd and cald1a support smooth muscle specialization. This indicates that a substantial fraction of the cluster exhibits vSMC-like functional properties.
+
+• Vascular tone and signaling machinery: gucy1a1, gucy1a2, ednraa, prkg1a, pde3a, pde5ab, s1pr2, adra1aa,
+cacna1c
+→ These genes mediate vasoreactivity, nitric oxide signaling, and contractile regulation, supporting a functional role in controlling vessel tone, which is characteristic of contractile mural cells (especially arteriolar vSMCs).
+
+• Basement membrane / vessel wall ECM: col4a1, col4a2, col5a3a, col6a1, col6a2, col6a4a, lama4, lamb1b,
+lamc1, lamc3, colec12, itga1
+→ Mural cells contribute to and reside within the vascular basement membrane. This strong ECM signature supports structural integration within the vessel wall, distinguishing these cells from non-vascular fibroblasts.
+
+• Developmental and lineage regulators: foxc1b, tbx2a, tbx2b, hey1, hey2, mef2cb, klf12a, notch1b, notch3
+→ These transcription factors are associated with mural-cell differentiation and vascular development, including smooth muscle specification and Notch-dependent arterial programs. Their presence supports a continuum of mural differentiation states rather than a single fixed identity.
+
+**Decision rule:**
+
+The combination of a pdgfrb/rgs5/notch3 mural-cell core together with a robust contractile smooth muscle module (acta2, tagln, myh11a, mylkb, cald1a, and myocd) supports annotation as mural cells. The clear co-expression of both pericyte-associated and vSMC-defining genes, without separation into distinct populations, supports interpretation as a mixed mural population spanning pericyte and smooth muscle states, rather than a single discrete subtype.
+
+**Distinguishing note:**
+
+This cluster is distinguished from more fibroblast-like perivascular stromal cells by its clear actomyosin contractile machinery, and from canonical capillary pericytes by its strong enrichment of vSMC markers such as acta2, tagln, myh11a, mylkb, cald1a, and myocd. At the same time, retention of pericyte markers (pdgfrb, rgs5a, cd248a) indicates that these cells do not represent a purely smooth muscle population. Instead, the dominant signal is a mural continuum state, capturing both pericyte and contractile smooth muscle features within a single cluster.
+
+```{r}
+DotPlot(lSeqNonLB, features = c(
+
+    # Core mural-cell identity
+    "pdgfrb", "rgs5a", "mcamb", "cd248a", "notch3",
+
+    # Pericyte-associated program
+    "rgs12b", "gpr4", "ndufa4l2a", "kcne4",
+
+    # Contractile smooth muscle (vSMC-like) program
+    "acta2", "tagln", "myh11a", "mylkb", "mylka",
+    "myl9b", "tpm1", "tpm4a", "tpm4b",
+    "cald1a", "myocd", "lmod1b",
+
+    # Vascular tone and signaling machinery
+    "gucy1a1", "gucy1a2", "ednraa",
+    "prkg1a", "pde3a", "pde5ab",
+    "s1pr2", "adra1aa", "cacna1c",
+
+    # Basement membrane / vessel wall ECM
+    "col4a1", "col4a2", "col5a3a",
+    "col6a1", "col6a2", "col6a4a",
+    "lama4", "lamb1b", "lamc1", "lamc3",
+    "colec12", "itga1",
+
+    # Developmental and lineage regulators
+    "foxc1b", "tbx2a", "tbx2b",
+    "hey1", "hey2", "mef2cb",
+    "klf12a", "notch1b"
+
+  )
+) + RotatedAxis()
+```
+
+
+### b5: pineal epithelial cells
+
+**Cluster b5: Pineal epithelial cells**
+
+One-line identity: Multiciliated pineal support cells, defined by a strong foxj1-driven motile cilia program, epithelial transport/ion-handling machinery, and pineal-lineage transcription factors, together with expression of visual-cycle / opsin-like genes (rgra, rrh) but absence of a canonical phototransduction cascade, consistent with the non-photoreceptor pineal support cell population described in zebrafish (D’Gama et al., 2021; Elazary et al., 2023; W. H. Li et al., 2015; Mano et al., 2019; Olstad et al., 2019).
+ 
+**Key evidence**
+
+• Pineal / epithalamic lineage identity: otx2b, lmx1ba, lmx1bb, barhl2, zic2a, zic4, otx1
+→ These transcription factors support a pineal/epithalamic epithelial lineage rather than generic ventricular epithelium. Otx/Lmx programs are central to zebrafish pineal specification and maintenance, anchoring this cluster to pineal tissue rather than broadly distributed ependyma.
+
+• Pineal glial / neuroepithelial support markers: fabp7a, atp1a1b
+→ Co-expression of fabp7a (lipid/metabolic support; canonical radial glial/neuroepithelial marker) and atp1a1b (ion transport and homeostasis) is consistent with non-photoreceptor pineal support cells with glial/neuroepithelial characteristics, as described in zebrafish pineal support cell populations (Elazary et al., 2023).
+
+• Multiciliated epithelial / ependymal-like program: foxj1a, foxj1b, dnah5, dnah9, dnah12, dnah7, dnaaf11,
+cfap45, cfap58, cfap221, tekt1, fsip1, intu
+→ A robust motile cilia gene network characteristic of Foxj1-dependent multiciliated epithelial cells. In zebrafish, this program defines ventricular and specialized epithelial cell types, including ciliated cells associated with brain cavities and sensory interfaces.
+
+• Transport / ion-handling support physiology: slc23a2, slc12a4, slc4a5b, slc4a2a, slc4a10b, slc6a4a,
+slc7a1a, slc29a1a, slc47a1, slco1e1, atp2b2, atp1b3b, trpm3, wnk4b
+→ Strong enrichment for solute transporters and ion regulators, consistent with epithelial support functions, including regulation of extracellular environment and metabolite exchange—hallmarks of non-neuronal pineal support cells.
+
+• Visual-cycle / opsin-like support features (non-photoreceptor): rgra, rrh, lratd2b
+→ Expression of RGR/RRH-type opsin-like genes and retinoid-associated factors without a full phototransduction cascade. Zebrafish pineal support/glial cells have been shown to express visual-cycle genes required for photoreceptor maintenance while remaining molecularly distinct from photoreceptors (Elazary et al., 2023).
+
+• Absence of canonical photoreceptor program: (no pde6c, gngt1, prph2b, impg1b, arrestins)
+→ The lack of core phototransduction machinery excludes pineal photoreceptor identity, despite the presence of opsin-like genes.
+
+**Decision rule:**
+
+The combination of a pineal-lineage transcriptional program (otx2/lmx/zic factors) together with a dominant foxj1-driven multiciliated epithelial signature, strong transport/ion-handling physiology, and the presence of visual-cycle/opsin-like genes (rgra, rrh) without a phototransduction cascade supports annotation as pineal support cells, specifically a multiciliated, non-photoreceptor epithelial/glial population associated with the pineal organ.
+
+**Distinguishing note:**
+
+This cluster is distinguished from pineal photoreceptors by the absence of a full phototransduction program and instead exhibits a strong multiciliated epithelial and support-cell physiology. It is distinguished from generic ventricular ependymal cells by its retention of pineal/epithalamic transcription factors (otx2b, lmx1ba/lmx1bb, barhl2) and visual-cycle gene expression, which align with recently described pineal-specific support/glial cells. The dominant signal is therefore pineal-associated multiciliated support cells, not generic ependyma and not photoreceptors.
+
+```{r}
+DotPlot(lSeqNonLB, features = c(
+
+    # Pineal / epithalamic lineage identity
+    "otx2b", "lmx1ba", "lmx1bb", "barhl2",
+    "zic2a", "zic4", "otx1",
+
+    # Pineal glial / neuroepithelial support markers
+    "fabp7a", "atp1a1b",
+
+    # Multiciliated epithelial / ependymal-like program
+    "foxj1a", "foxj1b", "dnah5", "dnah9",
+    "dnah12", "dnah7", "dnaaf11",
+    "cfap45", "cfap58", "cfap221",
+    "tekt1", "fsip1", "intu",
+
+    # Transport / ion-handling support physiology
+    "slc23a2", "slc12a4", "slc4a5b",
+    "slc4a2a", "slc4a10b", "slc6a4a",
+    "slc7a1a", "slc29a1a", "slc47a1",
+    "slco1e1", "atp2b2", "atp1b3b",
+    "trpm3", "wnk4b",
+
+    # Visual-cycle / opsin-like support features
+    "rgra", "rrh", "lratd2b"
+
+  )
+) + RotatedAxis()
+```
+### b6: Choroid plexus epithelium
+
+Cluster b6: Choroid plexus epithelium
+
+One-line identity: Choroid plexus epithelial cells — specialized ventricular epithelial cells forming the blood–CSF barrier, defined by a polarized epithelial junction program together with strong transporter-driven CSF secretion and lipid/metabolic processing characteristic of zebrafish choroid plexus (Alvers et al., 2014; Henson et al., 2014; Heppert et al., 2022; Jeong et al., 2024; Parab et al., 2021).
+.  
+Key evidence
+
+• Definitive choroid plexus epithelial / blood–CSF barrier identity:
+cldn15la, cdh17, cdhr2,  mpzl3, patj, itga3a, vegfaa/b
+→ The choroid plexus forms as a ventricular epithelial sheet with tight junctions and apical–basal polarity that constitute the blood–CSF barrier. The presence of epithelial adhesion and junction components (claudins, cadherins, polarity scaffolds) directly supports a choroid plexus epithelial identity rather than endothelial, mesenchymal, or generic ependymal cells.
+
+• CSF secretion / transporter-rich epithelial physiology:
+slc5a1, slc43a2b, slc4a4a, slc26a6, slc23a1, slco1e1, abcc4, slc2a2, slc15a1b
+→ Choroid plexus epithelial cells are defined by dense expression of solute carriers and transporters that mediate controlled exchange between blood and CSF. 
+
+• Lipid transport and apolipoprotein-associated program:
+apoba, apobb.1, cd36, fabp2, slc27a4, slc27a2a, dgat1a, dgat1b, lpcat3, plin3, npc1
+→ The strong lipid uptake, intracellular trafficking, and lipoprotein-related machinery supports a metabolically active secretory epithelium, consistent with choroid plexus roles in CSF composition and molecular transport, rather than passive barrier tissue.
+
+• Detoxification and metabolic filtering functions:
+ugt2a5, ces2b, cyp-related genes, gpx4a, acox1, acox3, hsd17b4, glud1a, glud1b, pck1, fbp1b
+→ Choroid plexus epithelium functions as a biochemical filter at the blood–CSF interface, and this cluster shows a strong enrichment for xenobiotic metabolism, lipid oxidation, and redox regulation, supporting that specialized barrier/secretory role.
+
+• Epithelial transcriptional regulators consistent with secretory barrier identity:
+hnf4a, hnf4b, hnf4g, nr1h4, gata6, creb3l3b
+→ These transcription factors support a highly specialized absorptive/secretory epithelial state, reinforcing that this cluster is not neuronal or glial, but a functionally specialized epithelial barrier tissue, consistent with choroid plexus differentiation and function.
+
+**Decision rule:**
+
+The combination of a ventricular epithelial barrier program, dense transporter expression consistent with CSF secretion, strong lipid/apolipoprotein handling, and a secretory metabolic-detoxification signature supports annotation as choroid plexus epithelium.
+
+**Distinguishing note:**
+
+This cluster is distinguished from generic ependymal cells by its much stronger transporter, lipid-handling, and detoxification programs, and from vascular barrier cells by its epithelial cadherin/junction profile and lack of a canonical endothelial identity. The dominant signal is secretory choroid plexus epithelium forming the blood–CSF barrier, not ordinary ventricular lining cells.
+
+```{r}
+DotPlot(lSeqNonLB, features = c(
+
+    # Choroid plexus epithelial / blood–CSF barrier identity
+    "cldn15la", "cdh17", "cdhr2", 
+    "mpzl3", "patj", "itga3a", "vegfaa", "vegfab",
+
+    # CSF secretion / transporter-rich epithelial physiology
+    "slc5a1", "slc43a2b", "slc4a4a",
+    "slc26a6", "slc23a1", "slco1e1",
+    "abcc4", "slc2a2", "slc15a1b",
+
+    # Lipid transport and apolipoprotein-associated program
+    "apoba", "apobb.1", "cd36", "fabp2",
+    "slc27a4", "slc27a2a", "dgat1a", "dgat1b",
+    "lpcat3", "plin3", "npc1",
+
+    # Detoxification and metabolic filtering functions
+    "ugt2a5", "ces2b", "gpx4a",
+    "acox1", "acox3", "hsd17b4",
+    "glud1a", "glud1b", "pck1", "fbp1b",
+
+    # Epithelial transcriptional regulators
+    "hnf4a", "hnf4b", "hnf4g",
+    "nr1h4", "gata6", "creb3l3b"
+
+  )
+) + RotatedAxis()
+```
+### b7: Pineal photoreceptors
+
+**Cluster b7: Pineal photoreceptors**
+
+One-line identity: Melatonin-producing, opsin-expressing pineal photoreceptor cells with a strong zebrafish pineal photoreceptor program, including direct photosensitivity, phototransduction machinery, retinoid-handling genes, and pineal-specifying transcription factors, rather than retinal carryover (Davies et al., 2015; Lagman et al., 2015; Mano et al., 2019; Sapède et al., 2020; Seritrakul & Gross, 2019; Vitorino et al., 2009).  
+ 
+**Key evidence**
+
+• Pineal neuroendocrine / melatonin-output identity: asmt, nfil3-6, bhlhe40, per2, npas2, tefa, hlfa
+→ This cluster carries a strong pineal circadian-neuroendocrine program. In zebrafish, the pineal gland is a melatonin-producing, directly photoreceptive circadian organ and asmt is a strong pineal anchor in zebrafish brain tissue. 
+
+• Direct pineal photosensitivity / opsin repertoire: opn4b, opn4xa, opn5, opn7b, opn8b, opn9
+→ The pineal is a well-established photosensitive organ in zebrafish, and transcriptomic work on zebrafish opsins showed that the pineal complex expresses a large opsin repertoire. 
+
+• Photoreceptor structural and phototransduction machinery: prom1b, rdh8a, rpe65a, rgrb, rgra, slc24a4a,
+trpm1b, myo7ab
+→ Zebrafish pineal photoreceptors are known to share core molecular and functional features with retinal photoreceptors. 
+
+• Retinoid-handling / visual-cycle-like program: rpe65a, rdh5, rdh8a, stra6, rgra, rgrb, rbp5, rbp4l
+→ This cluster has a retinoid-processing signature that is highly compatible with the zebrafish pineal. Recent zebrafish work showed that the pineal contains cells expressing visual-cycle genes and that these cells are required for pineal photoreceptor maintenance; additional zebrafish pineal studies explicitly note expression of visual-cycle genes such as rpe65a and rgra in the pineal gland.  
+
+• Pineal transcription factor program: otx5, lhx2b, pax7a, pax7b, bsx
+→ Otx5 is a core regulator of pineal photoreceptor/circadian gene expression, and bsx + otx5 together specify pineal photoreceptive identity. 
+
+• Not retinal carryover: absence of vsx2, gnat1, pde6a, pde6b, nr2e3, atoh7, pou4f2 
+→ These genes are canonical zebrafish retinal-lineage or retinal photoreceptor/RGC markers, so their absence makes a retinal carryover explanation much less likely.  
+
+**Decision rule:**
+
+The combined presence of a strong pineal melatonin/circadian module (asmt, nfil3-6, bhlhe40, and per2), a broad pineal opsin repertoire (opn4b, opn4xa, opn5, opn7b, opn8b, and opn9), photoreceptor and visual-cycle genes (rpe65a, rdh5, rdh8a, stra6, rgrb, prom1b, and slc24a4a), and the pineal photoreceptor TF anchor otx5 supports annotation as pineal photoreceptors.  
+
+**Distinguishing note:** 
+
+This cluster is distinguished from retinal contamination by the absence of classic zebrafish retinal-lineage markers in your check and from non-photoreceptive pineal cell types by its combined photoreceptor, opsin, retinoid-handling, and melatonin-output signatures. One caution is that published zebrafish pineal literature usually treats aanat2 rather than aanat1 as the canonical pineal AANAT gene, so I would not let aanat1 carry the annotation by itself; the call is strongest because the rest of the cluster is overwhelmingly pineal-photoreceptor-like.  
+
+```{r}
+DotPlot(lSeqNonLB, features = c(
+
+    # Pineal neuroendocrine / melatonin-output identity
+    "asmt", "nfil3-6", "bhlhe40", "per2",
+    "npas2", "tefa", "hlfa",
+
+    # Direct pineal photosensitivity / opsin repertoire
+    "opn4b", "opn4xa", "opn5",
+    "opn7b", "opn8b", "opn9",
+
+    # Photoreceptor structural and phototransduction machinery
+    "prom1b", "rdh8a", "rpe65a",
+    "rgrb", "rgra", "slc24a4a",
+    "trpm1b", "myo7ab",
+
+    # Retinoid-handling / visual-cycle-like program
+    "rdh5", "stra6", "rbp5", "rbp4l",
+
+    # Pineal transcription factor program
+    "otx5", "lhx2b", "pax7a", "pax7b", "bsx"
+
+  )
+) + RotatedAxis()
+```
+## Annotate peripheral clusters
+### p1: Vascular endothelium
+
+**Cluster 2: Vascular endothelium (arterial-leaning, non-lymphatic)**
+
+One-line identity: Peripheral vascular endothelial cells defined by a strong pan-endothelial program with an arterial-leaning signature, lacking a dominant lymphatic/sinusoidal (LYVE1/MRC1/STAB) module (Bonkhofer et al., 2019; Hasan et al., 2017; Sacilotto et al., 2013; Takahashi et al., 2001; Xu et al., 2009).
+ 
+**Key evidence**
+
+• Core endothelial / vascular identity: ptprb, pecam1b, tie1, egfl7, rasip1
+→ These genes establish the cluster as bona fide endothelium. Ptprb and pecam1b support endothelial identity, tie1 supports vascular endothelial specification, and egfl7 plus rasip1 are consistent with endothelial morphogenesis and vessel formation. 
+
+• VEGF receptor endothelial backbone: kdr, kdrl, flt1
+→ This receptor set reinforces that these are vascular endothelial cells responding to canonical endothelial growth-factor signaling. 
+
+• Arterial-leaning endothelial specialization: dll4, erg, sox7, sox18, cxcr4a
+→ dll4 is an arterial-leaning marker and erg supports a differentiated endothelial transcriptional program. 
+
+• Endothelial junction / adhesion and vessel integrity: am2a, pcdh12
+→ These genes support endothelial cell-cell adhesion and vessel organization. They help show this is a cohesive vascular endothelial population rather than hematopoietic carryover or stromal contamination.
+
+• Additional vascular support / transport features: eng, slc2a1a, slc38a5b, nrp2a
+→ These genes support a specialized vascular endothelial state. Eng fits best as vascular endothelium rather than junction-specific structure, while slc2a1a and slc38a5b suggest endothelial transport capacity, and nrp2a may indicate some non-arterial vascular heterogeneity layered onto the cluster.
+
+**Decision rule:**
+
+The combination of a strong endothelial backbone (ptprb, pecam1b, tie1, egfl7, and rasip1) plus endothelial VEGF receptors (kdr, kdrl, and flt1) and a more limited but meaningful arterial-leaning module (dll4 and erg) supports annotation as vascular endothelium with arterial bias.
+
+**Distinguishing note:**
+
+This cluster is distinguished from lymphatic/scavenger endothelium by the absence of a dominant lyve1/mrc1/stab/flt4 DEG program, and from hemogenic endothelium by the lack of a coherent runx1/tal1/gata2/erythroid module in the DEG core. The dominant signal is vascular endothelium, with subtype information coming primarily from dll4 rather than from the generic endothelial markers themselves.
+
+**Additional note:** 
+
+Although non-BBB vascular endothelium is present in the brain, we have chosen to group this cell type as peripheral because there are no clear genetic markers to differentiate between brain vasculature and vasculature from other tissues that may have contaminated the dissection. This possibility makes any surface vs cave compositional analysis innacurate and so we have excluded this cluster from that calculation by classifying it as peripheral. 
+
+```{r}
+DotPlot(lSeqNonLB, features = c(
+
+    # Core endothelial / vascular identity
+    "ptprb", "pecam1b", "tie1", "egfl7", "rasip1",
+
+    # VEGF receptor endothelial backbone
+    "kdr", "kdrl", "flt1",
+
+    # Arterial-leaning endothelial specialization
+    "dll4", "erg", "sox7", "sox18", "cxcr4a",
+
+    # Endothelial junction / adhesion and vessel integrity
+    "jam2a", "pcdh12",
+
+    # Additional vascular support / transport features
+    "eng", "slc2a1a", "slc38a5b", "nrp2a"
+
+  )
+) + RotatedAxis()
+```
+### p2: Surface epithelium
+
+**Cluster p2: Immune-responsive surface / mucosal epithelium**
+
+One-line identity: Surface epithelial cells with a strong squamous–mucosal barrier program and a superimposed inflammatory / cytokine-responsive state, consistent with activated zebrafish surface ectoderm–derived epithelium rather than an immune-cell cluster (De La Garza et al., 2013; Jänicke et al., 2010; Liu et al., 2016; Mathiyalagan et al., 2025; Oehlers et al., 2010; Progatzky et al., 2016; Sarmah et al., 2022; Slanchev et al., 2009; Sommer et al., 2020; Xie et al., 2021).  
+ 
+**Key evidence**
+
+•	Core epithelial / surface-barrier identity: krt5, krt99, ppl, evpla, evplb, scel, epcam, cldn7b, oclnb, grhl1, grhl3, elf3, tfap2c
+→ The dominant signal is epithelial, not hematopoietic. In zebrafish, grhl1 marks periderm / epidermal epithelial populations, grhl3 is required for periderm differentiation downstream of irf6, epcam is required for epithelial morphogenesis and integrity during skin development, and elf3 is required for epidermal development.  
+
+•	Junctional, polarity, and epithelial-sheet organization: cldn7b, oclnb, dsg2.1, epcam, mpp7a, pard3ba, rab25b, mal2, nectin4a, nectin4b
+→ These genes fit a cohesive epithelial sheet with apical-basal polarity, junctional sealing, and membrane trafficking rather than a migratory immune population.  
+
+•	Activated inflammatory / cytokine-responsive state layered on top of the epithelial identity: cxcl8a, il17rc, ifngr1, stat4, ripk2, traf2b, traf4a, ptgir, anxa1a, uba7
+→ These are best interpreted as a response program, not a lineage program. In zebrafish, cxcl8 is induced by inflammatory stimulation and functions in inflammatory recruitment, and zebrafish mucosal epithelia such as the gill mount robust inflammatory responses at epithelial interfaces. So the immune-like genes here are most consistent with an activated epithelium sensing cytokines, damage, microbes, or environmental stress rather than true immune-cell identity. 
+
+•	Surface squamous / mucosal specialization rather than neural, glial, or endothelial identity: upk3b, spint1a, spint1b, slc16a12b, aqp3a, slc17a9a, krt5, krt99, evplb, scel
+→ The cluster lacks a coherent neuronal, glial, endothelial, or stromal backbone and instead shows the sort of structural and transport-associated profile expected of exposed barrier epithelia. 
+
+**Decision rule:**
+
+The combination of a strong epithelial structural and polarity program (krt5, krt99, ppl, evplb, scel, epcam, cldn7b, and oclnb), together with zebrafish-supported epithelial regulators (grhl1, grhl3, and elf3) and a secondary inflammatory-response module (cxcl8a, il17rc, ifngr1, stat4, andripk2) supports annotation as surface epithelial cells are not sitting in a quiet baseline state, but instead are responding to outside signals.
+
+**Distinguishing note:**
+
+This cluster is distinguished from true immune populations by the absence of a coherent leukocyte core and by the overwhelming dominance of epithelial barrier and differentiation genes. It is distinguished from generic quiescent surface epithelium by its added chemokine / cytokine-response signature. The dominant signal is therefore surface epithelial identity first, with immune-responsive activation state second.
+
+```{r}
+DotPlot(lSeqNonLB, features = c(
+
+    # Core epithelial / surface-barrier identity
+    "krt5", "krt99", "ppl", "evpla", "evplb",
+    "scel", "epcam", "cldn7b", "oclnb",
+    "grhl1", "grhl3", "elf3", "tfap2c",
+
+    # Junctional, polarity, and epithelial-sheet organization
+    "dsg2.1", "mpp7a", "pard3ba",
+    "rab25b", "mal2", "nectin4a", "nectin4b",
+
+    # Inflammatory / cytokine-responsive state
+    "cxcl8a", "il17rc", "ifngr1", "stat4",
+    "ripk2", "traf2b", "traf4a", "ptgir",
+    "anxa1a", "uba7",
+
+    # Surface squamous / mucosal specialization
+    "upk3b", "spint1a", "spint1b",
+    "slc16a12b", "aqp3a", "slc17a9a"
+
+  )
+) + RotatedAxis()
+```
+
+
+### p3: Branchiomeric muscle
+
+**Cluster 5: Branchiomeric skeletal muscle fibers**
+
+One-line identity: Differentiated branchiomeric / head skeletal muscle fibers with a strong cardiopharyngeal lineage signal, defined by a complete sarcomeric contractile program, excitation–contraction coupling machinery, and neuromuscular-junction components, consistent with mature pharyngeal arch–derived striated muscle rather than cardiac, smooth, or progenitor muscle (Hinits et al., 2012; Lin et al., 2006; Müller et al., 2010; Olson et al., 2010; Ono et al., 2002; Paffett-Lugassy et al., 2017; Wang et al., 2021).  
+ 
+**Key evidence**
+
+• Fully differentiated striated muscle contractile apparatus: ttn.1, ttn.2, neb, myom1a, myom1b, myom2a, myom2b, myom3, obscna, obscnb, mybpc1, acta1b, actc1a, actc1b, myl1, myhb, myh7bb, tnnt1, tnnt3a, tnnt3b, actn3a, actn3b, ldb3a, ldb3b, nexn, dmd
+→ This is an unequivocal skeletal myofiber program. The combination of titin, nebulin, myomesin, myosin, troponin, and actinin genes indicates mature contractile fibers, not a progenitor or stromal population.  
+
+• Head / branchiomeric muscle lineage rather than generic trunk muscle: myf5, myod1, myog, mef2ca, mef2cb, nkx2.5
+→ Zebrafish cranial muscle development uses myf5 and myod in a distinct way from trunk myogenesis. Branchiomeric muscles arise from cardiopharyngeal progenitors linked to nkx2.5-positive anterior lateral plate mesoderm. In zebrafish, pharyngeal arch 2 muscles specifically derive from nkx2.5+ progenitors, and mef2ca/mef2cb are required for skeletal muscle differentiation. 
+
+• Excitation–contraction coupling machinery of mature skeletal fibers: ryr1a, ryr2b, ryr3, atp2a1, atp2a1l, cacna2d1a, jph1a, jph1b, jph2, trdn, atp1a2a, kcnj12b
+→ These genes support functional calcium release, calcium reuptake, triad organization, and membrane excitability typical of differentiated muscle fibers. In zebrafish, ryr1a/ryr1b are required for skeletal muscle contraction and atp2a1 encodes SERCA1, which is essential for muscle relaxation. 
+
+• Neuromuscular-junction specialization: colq, dok7b, rapsn, ache, jph1a, jph1b, jph2
+→ This cluster also carries a neuromuscular-junction program. In zebrafish, rapsyn is essential for acetylcholine receptor clustering, and dok7 promotes neuromuscular-junction formation and muscle integrity, supporting annotation as innervated skeletal muscle fibers rather than immature myoblasts.  
+
+• Metabolic and structural maturation consistent with terminally differentiated myofibers: ckma, ckmb, ak1, gyg1b, cpt1b, aldoab, eno3, ampd1, pfkfb3, coq10b
+→ These genes support ATP buffering, glycogen handling, glycolysis, and oxidative metabolism typical of active mature muscle. The cluster is therefore best interpreted as differentiated muscle fibers, not a low-complexity or transitional state. 
+
+**Decision rule:**
+
+The combination of a complete skeletal sarcomere program (ttn, neb, myom, mybpc1, myosin, troponin, and actin genes), cardiopharyngeal / branchiomeric lineage markers (myf5, myod1, myog, mef2ca, mef2cb, and nkx2.5), mature calcium-handling machinery (ryr1a, atp2a1, and jph), and neuromuscular-junction components (dok7b, rapsn, colq, and ache) supports annotation as branchiomeric skeletal muscle fibers.  
+
+**Distinguishing note:**
+
+This cluster is distinguished from cardiac muscle by its overwhelming skeletal sarcomeric and NMJ program, despite sharing some cardiopharyngeal-associated regulators such as nkx2.5 and mef2c paralogs. It is distinguished from smooth muscle / mural cells by the absence of a dominant acta2/myh11/tagln contractile signature and the presence instead of classic striated-muscle genes such as ttn, neb, mybpc1, ryr1a, and dok7b/rapsn. It is also distinguished from muscle progenitors by the heavy load of terminal structural and excitation–contraction genes, indicating a mature fiber state rather than a proliferative or early myogenic population.  
+
+```{r}
+DotPlot(lSeqNonLB, features = c(
+
+    # Differentiated striated muscle contractile apparatus
+    "ttn.1", "ttn.2", "neb",
+    "myom1a", "myom1b", "myom2a", "myom2b", "myom3",
+    "obscna", "obscnb", "mybpc1",
+    "acta1b", "actc1a", "actc1b",
+    "myl1", "myhb", "myh7bb",
+    "tnnt1", "tnnt3a", "tnnt3b",
+    "actn3a", "actn3b",
+    "ldb3a", "ldb3b", "nexn", "dmd",
+
+    # Head / branchiomeric muscle lineage
+    "myf5", "myod1", "myog",
+    "mef2ca", "mef2cb", "nkx2.5",
+
+    # Excitation–contraction coupling machinery
+    "ryr1a", "ryr2b", "ryr3",
+    "atp2a1", "atp2a1l", "cacna2d1a",
+    "jph1a", "jph1b", "jph2",
+    "trdn", "atp1a2a", "kcnj12b",
+
+    # Neuromuscular-junction specialization
+    "colq", "dok7b", "rapsn", "ache",
+
+    # Metabolic and structural maturation
+    "ckma", "ckmb", "ak1", "gyg1b",
+    "cpt1b", "aldoab", "eno3",
+    "ampd1", "pfkfb3", "coq10b"
+
+  )
+) + RotatedAxis()
+```
+### p4: Basal keratinocytes
+
+**Cluster p4: Basal keratinocytes / epidermal basal cells**
+
+One-line identity: Non-neural surface ectoderm–derived basal keratinocytes, defined by tp63/krt5 epithelial basal-cell identity together with hemidesmosome, laminin, collagen, integrin, and tight-junction genes that support attachment to the epidermal basement membrane (Esho et al., 2023; Fischer et al., 2014; Kim et al., 2010; Lee et al., 2014; Q. Li et al., 2011; Z. Liu et al., 2024; Molder et al., 2021; Phatak et al., 2021).
+ 
+**Key evidence**
+
+• Basal keratinocyte identity: krt5, krt8 (krt4), krt222, tp63, bnc1, fgfr2, itgb4
+→ Integrin beta 4 (itgb4) is a basal-cell marker during growth, homeostasis, and injury response and tp63 is required for zebrafish epidermal appendage / keratinocyte renewal programs.  
+
+• Basement membrane / hemidesmosome attachment program: col17a1a, col17a1b, col7a1, col7a1l, itgb4, itga6b, itga3b, lama5, lamb3, lamc2, lamb1a
+→ These genes support a basal epithelial cell identity at the dermal–epidermal interface. In zebrafish, col17a1a is expressed in skin and type XVII collagen (col17a1a and col17a1b) is a hemidesmosome-associated basement membrane protein. Further, the α6β4 integrin–laminin system is a core hemidesmosome adhesion module linking basal keratinocytes to the basement membrane.  
+
+• Epidermal barrier and junctional epithelial program: cldn1, cldni, epcam, jupa, ctnna1, ctnnd1, pard3aa, pard6gb, nectin1b, lsr
+→ These genes support epithelial polarity, adhesion, and barrier organization rather than neural, endothelial, or mesenchymal identity. Zebrafish skin has a defined epidermis separated from the dermis by a basement membrane zone that fits the epithelial-barrier context of these markers.  
+
+• Epidermal transcriptional regulation: grhl2b, irf6, tp63, tfap2c, dlx3b, dlx4a
+→ The grainyhead-like (grhl2b) program is strongly associated with zebrafish epidermal development and barrier maintenance. Grhl3 promotes epidermal cell retention and architecture, and irf6–grhl3 work supports a conserved keratinocyte/periderm differentiation program.  
+
+• Dermal–epidermal junction / anchoring complex: fras1, frem2a, frem2b, col7a1, col7a1l
+→ The fras1/frem2 module supports a skin basement membrane / dermal–epidermal junction context. Fraser-complex proteins are associated with anchoring structures at the dermal–epidermal junction, which fits the basal keratinocyte interpretation.  
+
+**Decision rule:**
+
+The combination of tp63/krt5 basal epithelial identity, itgb4/itga6b/laminin/col17a1/col7a1 basement membrane attachment machinery, epithelial junction genes, and Fraser-complex dermal–epidermal junction genes supports annotation as basal keratinocytes / epidermal basal cells.
+
+**Distinguishing note:**
+
+This cluster is distinguished from superficial/mucosal epithelium by its stronger basal attachment program: col17a1a/b, col7a1/col7a1l, itgb4, itga6b, lama5, lamb3, lamc2. It is distinguished from fibroblasts by epithelial keratin and junction genes, and from neural/glial/endothelial populations by the absence of a coherent neuronal, glial, or vascular marker program.
+
+```{r}
+DotPlot(lSeqNonLB, features = c(
+
+    # Basal keratinocyte identity
+    "krt5", "krt8", "krt222",
+    "tp63", "bnc1", "fgfr2", "itgb4",
+
+    # Basement membrane / hemidesmosome attachment
+    "col17a1a", "col17a1b", "col7a1", "col7a1l",
+    "itga6b", "itga3b",
+    "lama5", "lamb3", "lamc2", "lamb1a",
+
+    # Epidermal barrier / junctional program
+    "cldn1", "cldni", "epcam", "jupa",
+    "ctnna1", "ctnnd1", "pard3aa",
+    "pard6gb", "nectin1b", "lsr",
+
+    # Epidermal transcriptional regulation
+    "grhl2b", "irf6", "tfap2c", "dlx3b", "dlx4a",
+
+    # Dermal–epidermal junction / anchoring complex
+    "fras1", "frem2a", "frem2b"
+
+  )
+) + RotatedAxis()
+```
+### p5: Erythrocytes
+
+**Cluster p5: Erythrocytes / red blood cells**
+
+One-line identity: Mature erythrocytes, defined by a coherent erythroid transcriptional program, heme/iron-handling machinery, hemoglobin-associated oxygen transport genes, and red-cell membrane/cytoskeletal components (Chen et al., 2020; Gore et al., 2018; K. Kim et al., 2025; Suzuki et al., 2023; Zhang et al., 2021).
+ 
+**Key evidence**
+
+• Erythroid lineage and maturation program: gata1a, klf1, cbfa2t3, jak2a, rpl18
+→ These genes support erythroid identity rather than generic blood contamination. Zebrafish erythropoiesis depends on erythroid transcriptional regulators, like gata1a, while klf1/klf17 are involved in erythroid maturation.  
+
+• Heme synthesis, iron handling, and hemoglobin-associated function: alas2, slc25a37, slc25a39, fech, tfr1a, ncoa4, fth1a, hbbe1.1
+→ These genes indicate hemoglobin-producing erythroid cells:  alas2 is an erythroid heme-synthesis enzyme, mitoferrin (slc25a37) supports mitochondrial iron import for heme production, and hbbe1.1 is an embryonic β-globin gene used as a zebrafish erythroid marker. 
+
+• Red blood cell membrane and cytoskeletal scaffold: slc4a1a, ank1a, sptb, add2, rhag
+→ slc4a1a encodes the Band 3/anion-exchanger erythrocyte membrane protein, ank1a, sptb, and add2 support the specialized erythrocyte membrane skeleton.  
+
+• Oxidative-stress buffering and red-cell metabolism: prdx2, gpx1a, gpx4b, aldoa/aldob-associated glycolytic program, cahz
+→ Hemoglobin-rich erythrocytes require strong antioxidant and metabolic buffering. This function is mediated through expression of genes such as prdx2 and gpx1a/gpx4b that support ROS handling. In addition, cahz and slc4a1a support CO₂/bicarbonate transport and erythrocyte gas-exchange physiology.
+
+• Ion and volume regulation: kcnn4, slc4a1a, wnk2, wnk4b, slc9a1b
+→ These genes support mature red-cell membrane physiology. For example, kcnn4 is likely involved in erythrocyte ion/volume regulation.
+
+**Decision rule:**
+
+The combination of erythroid regulators (gata1a and klf1), heme/iron genes (alas2, slc25a37, fech, and tfr1a), globin-associated identity (hbbe1.1), and RBC membrane scaffold genes (slc4a1a, ank1a, sptb, and add2) supports annotation as erythrocytes / red blood cells.
+
+**Distinguishing note:**
+
+This cluster is distinguished from endothelial or vascular-associated cells by its dominant erythroid membrane and heme-production program, and from hematopoietic progenitors by the strong mature RBC scaffold and oxygen-transport machinery. The dominant signal is mature circulating erythrocytes, not a mixed blood progenitor population.
+
+```{r}
+DotPlot(lSeqNonLB, features = c(
+
+    # Erythroid lineage and maturation program
+    "gata1a", "klf1", "cbfa2t3", "jak2a", "rpl18",
+
+    # Heme synthesis, iron handling, and hemoglobin-associated function
+    "alas2", "slc25a37", "slc25a39",
+    "fech", "tfr1a", "ncoa4", "fth1a", "hbbe1.1",
+
+    # Red blood cell membrane and cytoskeletal scaffold
+    "slc4a1a", "ank1a", "sptb", "add2", "rhag",
+
+    # Oxidative-stress buffering and red-cell metabolism
+    "prdx2", "gpx1a", "gpx4b",
+    "aldoa", "aldob", "cahz",
+
+    # Ion and volume regulation
+    "kcnn4", "wnk2", "wnk4b", "slc9a1b"
+
+  )
+) + RotatedAxis()
+```
+### p6: Chondrocytes
+
+**Cluster p6: Chondrocytes**
+
+One-line identity: Matrix-producing chondrocytes, defined by sox9a/sox5/sox6 cartilage regulatory genes together with strong cartilage ECM, proteoglycan, collagen-processing, and chondrocyte signaling programs (Baas et al., 2009; Giovannone et al., 2019; He et al., 2016; Lawrence et al., 2018; Smeeton et al., 2022; Yan et al., 2002; Yokoi et al., 2009).
+ 
+**Key evidence**
+
+• Core cartilage matrix identity: col2a1a, col9a1a, col9a2, col9a3, col11a1a, col11a2, col27a1a, col27a1b, acana, acanb, matn1, matn4, epyc, snorc, hapln1b
+→ Zebrafish chondrocyte populations are defined by cartilage matrix genes such as col2a1a, acana/acanb and collagen II/XI/IX-family genes.  
+
+• Chondrocyte regulatory transcription factors: sox9a, sox5, sox6, mef2ab
+→ These genes differentiate this cartilage cluster from a generic ECM-producing mesenchymal population. Sox9a is required for zebrafish cartilage morphogenesis and overt cartilage differentiation, while sox5/sox6 support the chondrogenic program with Sox9-family activity. 
+
+• Proteoglycan and glycosaminoglycan synthesis / matrix assembly: xylt1, chsy1, chsy3, chst3b, chst7, csgalnact1a, papss2b, ugdh, slc35d1a
+→ These genes support cartilage proteoglycan and chondroitin sulfate matrix production. This is important because the cluster is not just collagen-rich; it has the glycosaminoglycan biosynthetic machinery expected for cartilage ECM.
+
+• Collagen processing and matrix maturation: adamts3, p4ha2, p4ha1a, p3h2, lo xl3b, lo xl2a, serpinh1b, fkbp10b, colgalt1b, colgalt2b
+→ These genes support active collagen modification, folding, and matrix remodeling. Together with the collagen/proteoglycan core, this indicates actively matrix-producing chondrocytes rather than contaminating connective tissue.
+
+• Cartilage growth / maturation signaling: fgfr3, fgfrl1b, bmpr1bb, pth1r, npr2, ccn2a, ccn6, thbs1b, trpv4
+→ These genes are consistent with chondrocyte maturation, cartilage growth control, and matrix homeostasis. Zebrafish jaw cartilage regeneration studies identify chondrocyte clusters with mature and immature cartilage programs, supporting this type of transcriptional subdivision within cartilage.  
+
+**Decision rule:**
+
+The combination of sox9a, sox5, and sox6 cartilage regulatory genes, strong cartilage collagens (col2a1a, col9a1a/2/3, and col11a1a/2), proteoglycan matrix genes (acana, acanb, hapln1b, epyc, and snorc), and cartilage matrix-processing machinery supports annotation as chondrocytes.
+
+**Distinguishing note:**
+
+This cluster is distinguished from fibroblasts by its cartilage-specific matrix program, especially col2a1a, col9a genes, col11a genes, acana/acanb, matn1, and sox9a. It is distinguished from osteoblast-like cells by the absence of a dominant mineralizing bone program and by the strong chondrogenic Sox9/collagen II/aggrecan signature. The dominant signal is matrix-producing cartilage, not generic mesenchyme.
+
+```{r}
+DotPlot(lSeqNonLB, features = c(
+
+    # Core cartilage matrix identity
+    "col2a1a", "col9a1a", "col9a2", "col9a3",
+    "col11a1a", "col11a2",
+    "col27a1a", "col27a1b",
+    "acana", "acanb",
+    "matn1", "matn4",
+    "epyc", "snorc", "hapln1b",
+
+    # Chondrocyte regulatory transcription factors
+    "sox9a", "sox5", "sox6", "mef2ab",
+
+    # Proteoglycan / glycosaminoglycan synthesis
+    "xylt1", "chsy1", "chsy3",
+    "chst3b", "chst7",
+    "csgalnact1a", "papss2b",
+    "ugdh", "slc35d1a",
+
+    # Collagen processing and matrix maturation
+    "adamts3", "p4ha2", "p4ha1a",
+    "p3h2", "loxl3b", "loxl2a",
+    "serpinh1b", "fkbp10b",
+    "colgalt1b", "colgalt2b",
+
+    # Cartilage growth / maturation signaling
+    "fgfr3", "fgfrl1b", "bmpr1bb",
+    "pth1r", "npr2",
+    "ccn2a", "ccn6",
+    "thbs1b", "trpv4"
+
+  )
+) + RotatedAxis()
+```
+### p7: OSNs
+
+**Cluster p7: Olfactory sensory neurons**
+
+One-line identity: Olfactory sensory neurons (OSNs), most consistent with mature ciliated/odorant-transduction OSNs, defined by olfactory G-protein signaling genes, sensory transduction machinery, ciliary/axon-associated genes, and neuronal synaptic/axon guidance features (Bergboer et al., 2018; Calvo-Ochoa et al., 2021; W. Chen et al., 2025; Dang et al., 2018; Sato et al., 2005; Shao et al., 2017).
+ 
+**Key evidence**
+
+• Mature ciliated olfactory sensory neuron identity: ompa, gnal, gng13b, gnao1b, rgs11, adcy8, ano2b, pde1ca, pde1cb, pde4ba
+→ These genes support mature ciliated OSN identity. Ompa supports mature OSNs, while gnal/gng13b/gnao1b, adcy8, ano2b, PDE genes, and rgs11 support olfactory signal transduction downstream of odorant receptor activation.
+
+
+• Sensory cilium structure / intraflagellar transport: ift122, ift172, ift80, ift81, ift88, ift140, ift27, tulp3, rfx3, rpgrip1l, tmem67, bbs7
+→ These genes support the ciliated sensory apparatus required for olfactory detection. 
+
+• Chemosensory / GPCR-associated signaling: gpr158a, gpr137bb, rxfp2a, drd2a, drd2b, adcyap1b, gabbr1a
+→ These genes support a receptor-rich sensory-neuron identity. In zebrafish olfactory epithelium, OSN subtypes are organized around distinct receptor and GPCR-linked transduction programs, including OR/TAAR-associated ciliated OSNs and other chemosensory OSN classes.  
+
+• Axon guidance / olfactory projection features: cntn4, cntnap5a, dcc, unc5a, unc5b, epha6, efna2a, flrt1a, flrt1b, l1cama, l1camb, ncam1b, robo2
+→ These genes support sensory neurons that project axons to olfactory bulb targets. Zebrafish OSNs project from the olfactory epithelium to defined olfactory bulb glomeruli/protoglomeruli. 
+
+• Neuronal differentiation / synaptic machinery: syt1a, syt7a, syt17, snap25b, cadpsa, cadpsb, rims1b, rims3, unc13a, pp fia2, cacna1ba, cacna1db, scn1lab, scn5lab, kcna3a, kcna4, gng8, 
+→ These genes confirm that the cluster is neuronal and synaptically competent, not a supporting epithelial, mesenchymal, immune, or glial population.
+
+**Decision rule:**
+
+The combination of olfactory transduction genes, especially gnal, gng13b, gnao1b, rgs11, ano2b, adcy8, and PDE genes, together with ompa and many ciliary/IFT genes, supports annotation as olfactory sensory neurons.
+
+**Distinguishing note:**
+
+This cluster is distinguished from inner-ear/otic sensory cells by the dominant olfactory G-protein/transduction signature, especially gnal and gng13b, and also by OSN-associated ciliary and axon-guidance programs. 
+
+```{r}
+DotPlot(lSeqNonLB, features = c(
+
+    # Mature ciliated olfactory sensory neuron identity
+    "ompa", "gnal", "gng13b", "gnao1b",
+    "rgs11", "adcy8", "ano2b",
+    "pde1ca", "pde1cb", "pde4ba",
+
+    # Sensory cilium structure / intraflagellar transport
+    "ift122", "ift172", "ift80", "ift81",
+    "ift88", "ift140", "ift27",
+    "tulp3", "rfx3", "rpgrip1l",
+    "tmem67", "bbs7",
+
+    # Chemosensory / GPCR-associated signaling
+    "gpr158a", "gpr137bb", "rxfp2a",
+    "drd2a", "drd2b", "adcyap1b", "gabbr1a",
+
+    # Axon guidance / olfactory projection features
+    "cntn4", "cntnap5a", "dcc",
+    "unc5a", "unc5b",
+    "epha6", "efna2a",
+    "flrt1a", "flrt1b",
+    "l1cama", "l1camb",
+    "ncam1b", "robo2",
+
+    # Neuronal differentiation / synaptic machinery
+    "syt1a", "syt7a", "syt17",
+    "snap25b", "cadpsa", "cadpsb",
+    "rims1b", "rims3", "unc13a", "ppfia2",
+    "cacna1ba", "cacna1db",
+    "scn1lab", "scn5lab",
+    "kcna3a", "kcna4", "gng8"
+
+  )
+) + RotatedAxis()
+```
+### p8: Skeletal muscle
+
+**Cluster p8: Myocytes**
+
+One-line identity: Mature skeletal muscle / myofiber cluster, defined by a strong sarcomere-contractile program, excitation–contraction coupling machinery, muscle membrane/costamere components, and myogenic structural assembly factors (Chong et al., 2020; Ferrante et al., 2011; Ha et al., 2013; Horstick et al., 2013; Sztal et al., 2015).
+ 
+**Key evidence**
+
+• Sarcomere / contractile myofiber core: mylpfb, mylpfa, myl1, ttn.1, ttn.2, neb, tnnt3a, tnnt3b, acta1b, actc1a, actc1b, mybpc1, myom1a, myom1b, myom2a, myom2b, myoz1b, myot, obscnb, xirp2a, xirp2b
+→ This cluster is dominated by myofibrillar and sarcomere genes, including titin, nebulin, actin, troponin, myosin light chain, myosin-binding, myomesin, and Z-disc/costamere-associated genes.
+
+• Excitation–contraction coupling / calcium handling: atp2a1l, stac3, ryr3, jph1a, jph1b, calm1b, calm2a, calm3a, calm3b, slc25a4, slc25a5
+→ These genes support functional contractile myofibers with calcium cycling and excitation–contraction machinery. Atp2a1l/SERCA-like calcium handling, ryanodine receptor expression, and junctophilin genes are consistent with mature muscle calcium-release and sarcoplasmic-reticulum organization. 
+
+• Muscle membrane / structural anchoring program: xirp2a, xirp2b, myot, prx, rtn4b, rtn2a, tmod4, capza1b, flot1b
+→ These support structural stabilization of the contractile apparatus and muscle membrane-associated architecture. This is consistent with differentiated myofibers rather than generic mesenchymal or epithelial cells.
+
+• Myofiber assembly and remodeling factors: hacd1, trim63a, mylk3, ckma, ckmb, ckmt1, ckmt2b, pygmb
+→ These genes support mature muscle assembly, contractile maintenance, and muscle energy buffering. Creatine kinase genes and glycogen/metabolic genes fit an energetically active contractile cell type.
+
+• Metabolic support for contractile muscle: aco2, idh2, cs, dlst, dldh, pdha1a, pdhb, mdh2, got2a, ndufa genes, ndufb genes, ndufs genes, atp5 genes, vdac2, vdac3
+→ This broad mitochondrial/TCA/oxidative phosphorylation signature is consistent with the high energetic demand of differentiated myofibers.
+
+• Fiber-type: mylpfb, mylpfa, tnnt3a, tnnt3b, actn3a, actn3b, pvalb6, ckmb, myh7bb 
+→ The DEG list is strongly compatible with skeletal myofibers, with fast-fiber-associated markers such as mylpf/tnnt3/actn3/pvalb6. 
+
+**Decision rule:**
+
+The combination of sarcomere genes, especially mylpfb, ttn.1, ttn.2, tnnt3a, neb, acta1b, actc1a/b, mybpc1, myom genes, myoz1b, myot, and xirp2a/b, together with calcium-handling and muscle metabolic genes, supports annotation as mature skeletal muscle / myofibers.
+
+**Distinguishing note:**
+
+This cluster is distinguished from muscle progenitors by the dominance of differentiated contractile genes rather than primarily myod1/myf5/myog-like regulatory genes. It is distinguished from fibroblasts or tendon/connective tissue by the overwhelming sarcomere program. It is also not cardiac muscle despite actc1a/b and tnnt-like genes, because the broader signature includes skeletal muscle-associated mylpf, tnnt3, acta1b, actn3, neb, ttn, and fast-fiber/metabolic markers.
+
+```{r}
+DotPlot(lSeqNonLB, features = c(
+
+    # Sarcomere / contractile myofiber core
+    "mylpfb", "mylpfa", "myl1",
+    "ttn.1", "ttn.2", "neb",
+    "tnnt3a", "tnnt3b",
+    "acta1b", "actc1a", "actc1b",
+    "mybpc1",
+    "myom1a", "myom1b", "myom2a", "myom2b",
+    "myoz1b", "myot", "obscnb",
+    "xirp2a", "xirp2b",
+
+    # Excitation–contraction coupling / calcium handling
+    "atp2a1l", "stac3", "ryr3",
+    "jph1a", "jph1b",
+    "calm1b", "calm2a", "calm3a", "calm3b",
+    "slc25a4", "slc25a5",
+
+    # Muscle membrane / structural anchoring
+    "prx", "rtn4b", "rtn2a",
+    "tmod4", "capza1b", "flot1b",
+
+    # Myofiber assembly / remodeling and energy buffering
+    "hacd1", "trim63a", "mylk3",
+    "ckma", "ckmb", "ckmt1", "ckmt2b", "pygmb",
+
+    # Mitochondrial / metabolic support
+    "aco2", "idh2", "cs", "dlst", "dldh",
+    "pdha1a", "pdhb", "mdh2", "got2a",
+    "vdac2", "vdac3",
+
+    # Skeletal muscle fiber-type features
+    "actn3a", "actn3b", "pvalb6", "myh7bb"
+
+  )
+) + RotatedAxis()
+```
+### p9: LL support cells
+
+**Cluster p9: Lateral-line supporting cells**
+
+One-line identity: Lateral-line neuromast supporting/progenitor epithelial cells, defined by lateral-line signaling and patterning genes together with epithelial junction/adhesion genes, partial hair-cell–associated sensory-organ markers, and absence of a strong otic matrix or mature mechanosensory hair-cell program (Han et al., 2011; Shi et al., 2023; Smith et al., 2023).
+ 
+**Key evidence**
+
+• Lateral-line support cell program: tfap2a, fgfr1a, cxcr4b, fat1b, tnfsf10l3,
+→ These genes support lateral-line neuromast identity rather than generic epithelium: cxcr4b is strongly associated with lateral-line primordium migration, fgfr1a fits signaling-active neuromast progenitor/supporting-cell states, and tfap2a supports cranial placodal/lateral-line sensory epithelial identity.
+
+• Supporting-cell / epithelial identity: krt18b, krt1-c5, grhl2a, grhl2b, cdh2, gjc4b, itgb5, col7a1, kirrel3l, ctnna1
+→ These genes support a polarized epithelial/supporting-cell population rather than neurons or mature hair cells. The keratin, Grainyhead-like, cadherin/catenin, connexin, integrin, and basement-membrane-associated genes indicate epithelial organization and adhesion.
+
+• Hair-cell-associated sensory-organ context: ush1c, cadm4, prom1a, syt14a, cbln18, cbln20
+→ These genes place the cluster within a hair-cell-containing sensory organ environment. However, the DEG list is not dominated by mature mechanotransduction/hair-bundle genes, so these are best interpreted as sensory-organ association rather than mature hair-cell identity.
+
+• Against otic matrix / inner-ear epithelial identity: absence of sox10, stm, otog, otogl, otomp, tecta
+→ The lack of strong otic matrix and otic epithelial genes weakens an inner-ear sensory epithelium annotation and supports a lateral-line neuromast supporting-cell identity instead.
+
+**Decision rule:**
+
+The combination of lateral-line-associated signaling genes, especially tfap2a, cxcr4b, fgfr1a, and fat1b, with epithelial junction/adhesion genes and only partial hair-cell-associated signal supports annotation as lateral-line supporting cells.
+
+**Distinguishing note:**
+
+This cluster is distinguished from mature hair cells by the absence of a dominant mechanotransduction and stereocilia program. It is distinguished from otic sensory epithelium by the lack of strong otic matrix genes such as otog, otogl, otomp, and tecta. The dominant signal is lateral-line sensory epithelial support/progenitor identity, not mature hair-cell identity.
+
+```{r}
+DotPlot(lSeqNonLB, features = c(
+
+    # Lateral-line support cell program
+    "tfap2a", "fgfr1a", "cxcr4b",
+    "fat1b", "tnfsf10l3",
+
+    # Supporting-cell / epithelial identity
+    "krt18b", "krt1-c5",
+    "grhl2a", "grhl2b",
+    "cdh2", "gjc4b", "itgb5",
+    "col7a1", "kirrel3l", "ctnna1",
+
+    # Hair-cell-associated sensory-organ context
+    "ush1c", "cadm4", "prom1a",
+    "syt14a", "cbln18", "cbln20"
+
+  )
+) + RotatedAxis()
+```
+### p10: Otic support cells
+
+**Cluster p10: Otic sensory epithelium / otolith-matrix supporting cells**
+
+One-line identity: Inner-ear otic sensory epithelium / otolith-associated supporting cells, defined by strong otolith/tectorial-matrix genes, otic epithelial structural genes, and inner-ear patterning factors, with limited mature hair-cell mechanotransduction signal (Murayama et al., 2005; Shi et al., 2023; Smith et al., 2023; Söllner et al., 2003, 2004; Stooke-Vaughan et al., 2015).
+ 
+**Key evidence**
+
+• Otolith / tectorial-matrix identity: stm, otomp, otog, tectb, zpld1a, col9a1a, col9a1b, col9a2, col9a3, col11a2, col2a1a
+→ These genes support an inner-ear otic epithelial identity: stm is a zebrafish otolith biomineralization gene; otog and α-tectorin/tecta are required for otolith tethering to the sensory macula, and otomp/OMP-1 and otolin genes are required for normal otolith growth and anchoring onto sensory maculae.
+
+• Otic epithelial structure / supporting-cell features: magi2a, itga6a, pard6b, cdh7a, kirrel1b, nphs1
+→ These genes support epithelial polarity, adhesion, and junctional organization typical of sensory epithelia rather than neurons.
+
+• Otic patterning / epithelial morphogenesis: lmx1ba, lmx1bb, wnt3, sfrp1a, ryk, ptk7a, dacha, epha4a, epha4l
+→ These genes support otic vesicle patterning and spatial organization of sensory vs non-sensory domains. lmx1ba/lmx1bb in particular indicate inner-ear epithelial patterning, reinforcing that this is a structured otic tissue rather than generic epithelium.
+
+• Sensory-organ (hearing/vestibular) context without mature hair-cell identity: ush2a
+→ ush2a links the cluster to a hearing-related sensory system, but the DEG list lacks dominant mechanotransduction and stereocilia genes (e.g., tmc, myo7aa, cdh23, pcdh15a, espn, slc17a8). This indicates association with the sensory organ without being the mature mechanosensory hair cells themselves.
+
+**Decision rule:**
+
+The combination of stm, otomp, otog, tectb, otic matrix collagens, and lmx1ba/lmx1bb supports annotation as inner-ear otic sensory epithelium / otolith-matrix supporting cells.
+
+**Distinguishing note:**
+
+This cluster is distinguished from lateral-line supporting cells by the strong otolith/otic-matrix program, especially stm, otog, otomp, and tectb. It is distinguished from mature hair cells by the lack of a dominant mechanotransduction and stereocilia program. The dominant signal is inner-ear otolith-associated sensory epithelium/supporting cells, not lateral line and not mature hair cells.
+
+```{r}
+DotPlot(lSeqNonLB, features = c(
+
+    # Otolith / tectorial-matrix identity
+    "stm", "otomp", "otog", "tectb",
+    "zpld1a",
+    "col9a1a", "col9a1b", "col9a2", "col9a3",
+    "col11a2", "col2a1a",
+
+    # Otic epithelial structure / supporting-cell features
+    "magi2a", "itga6a", "pard6b",
+    "cdh7a", "kirrel1b", "nphs1",
+
+    # Otic patterning / epithelial morphogenesis
+    "lmx1ba", "lmx1bb",
+    "wnt3", "sfrp1a",
+    "ryk", "ptk7a",
+    "dacha",
+    "epha4a", "epha4l",
+
+    # Sensory-organ context
+    "ush2a"
+
+  )
+) + RotatedAxis()
+```
+### p11: Schwann cells
+
+**Cluster p11: Schwann cells**
+
+One-line identity: Myelinating peripheral Schwann cells, defined by a strong PNS glial/myelin program, Schwann-associated adhesion genes, ErbB signaling, and nodal/axo-glial organization genes (Eshed et al., 2005; Heermann et al., 2011; Konrad et al., 2006; Lyons et al., 2005; Raphael et al., 2010; Raphael & Talbot, 2011).
+ 
+**Key evidence**
+
+• Core Schwann / peripheral glial identity: cdh19, cldn19, erbb2, erbb3a, erbb3b, pou3f1, sox2, sox10
+→ These genes support Schwann-cell identity rather than CNS oligodendrocytes. erbb2/erbb3 signaling is required for Schwann cell migration and myelination in zebrafish, while cdh19, cldn19, and pou3f1 fit peripheral glial/Schwann differentiation and myelinating Schwann-cell maturation. 
+
+• Myelin sheath program: mbpa, mbpb, mag, bcas1, qki2, gal3st1a, abca2
+→ These genes support a myelinating glial state: mbp expression marks myelinating glia in zebrafish, including Schwann cells along peripheral nerves, while mag, qki, gal3st1, and abca2 support myelin membrane organization and lipid-rich sheath production. 
+
+• Axo-glial junction / nodal organization: gldn, nfascb, cntn1a, cntn2, drp2, ank2b, cdh6
+→ These genes support peripheral axon–glia organization: gldn/gliomedin and neurofascin/contactin-family adhesion molecules are central to nodal and paranodal architecture at myelinated axons, while drp2 is consistent with Schwann-cell myelin-associated dystroglycan/periaxin-type organization. 
+
+• ErbB / axon-dependent Schwann signaling: erbb2, erbb3a, erbb3b, tgfbr2b, gfra4b, prkg2, paqr6
+→ This signaling profile fits Schwann cells interacting with peripheral axons. In zebrafish, erbb2 and erbb3 are required for Schwann cell development, migration.
+
+• Schwann-cell adhesion / basal-lamina-associated support: itgb1a, itgb6, tln2b, chst7, smoc2, olfml2a, gpc5c, jupb, plekha7a, plekha7b, rac1b
+→ These genes support the adhesive and extracellular-supportive character of Schwann cells. Schwann cells form peripheral nerve-associated glial sheaths and interact closely with axons and surrounding matrix, so this adhesion/ECM program fits myelinating PNS glia rather than CNS oligodendrocytes.
+
+**Decision rule:**
+
+The combination of cdh19, cldn19, and erbb2/erbb3a/erbb3b, strong myelin genes (mbpa, mbpb, mag, bcas1, qki2, and gal3st1a), and nodal/axo-glial genes (gldn, nfascb, cntn1a, cntn2, and drp2) supports annotation as myelinating Schwann cells.
+
+**Distinguishing note:**
+
+This cluster is distinguished from CNS oligodendrocytes by the Schwann/PNS-associated genes cdh19, cldn19, erbb2/erbb3, drp2, and gldn, together with the peripheral axo-glial/nodal program. Although several myelin genes are shared with oligodendrocytes, the dominant signal is peripheral Schwann-cell myelination rather than CNS oligodendrocyte identity.
+
+```{r}
+DotPlot(lSeqNonLB, features = c(
+
+    # Core Schwann / peripheral glial identity
+    "cdh19", "cldn19",
+    "erbb2", "erbb3a", "erbb3b",
+    "pou3f1", "sox2", "sox10",
+
+    # Myelin sheath program
+    "mbpa", "mbpb", "mag", "bcas1",
+    "qki2", "gal3st1a", "abca2",
+
+    # Axo-glial junction / nodal organization
+    "gldn", "nfascb", "cntn1a", "cntn2",
+    "drp2", "ank2b", "cdh6",
+
+    # ErbB / axon-dependent Schwann signaling
+    "tgfbr2b", "gfra4b", "prkg2", "paqr6",
+
+    # Schwann-cell adhesion / basal-lamina support
+    "itgb1a", "itgb6", "tln2b",
+    "chst7", "smoc2", "olfml2a", "gpc5c",
+    "jupb", "plekha7a", "plekha7b", "rac1b"
+
+  )
+) + RotatedAxis()
+```
+### p12: Pituitary endocrine
+
+**Cluster 17: Pituitary endocrine cells**
+
+One-line identity: Mixed adenohypophyseal endocrine cells, defined by pituitary developmental transcription factors, multiple hormone lineages, and neuroendocrine secretory-processing machinery (Herzog et al., 2003; N. A. Liu et al., 2003; Nica et al., 2004; D. Wang et al., 2017; C. Y. Yan et al., 2023).
+ 
+**Key evidence**
+
+• Pituitary developmental / adenohypophyseal identity: pou1f1, lhx3, pitx3, six3a, insm1a, neurod1
+→ These genes support adenohypophyseal endocrine identity: pou1f1/pit1, lhx3, and pitx3 are central pituitary developmental markers in zebrafish. Pou1f1, specifically, is required for somatotroph, lactotroph, and thyrotroph lineages. 
+
+• Mixed pituitary hormone lineages: gh1, prl, pomca
+→ These genes identify multiple endocrine lineages within the adenohypophysis: gh1 marks somatotrophs, prl marks lactotrophs, and pomca marks corticotroph/melanotroph-lineage cells. The co-enrichment of multiple hormone genes supports a mixed pituitary endocrine cluster rather than a single pure hormone subtype.
+
+• Neuroendocrine secretory / hormone-processing machinery: scg3, pcsk2, cpe, ptprn2, baiap3, rab3da, rab3db, snap25b, stx1a, cplx2, doc2b
+→ These genes support a secretory endocrine/neuroendocrine state: pcsk2 and cpe are consistent with peptide hormone processing, while scg3, rab3, snap25b, stx1a, and cplx2 support regulated dense-core vesicle secretion. 
+
+• Pituitary responsiveness / GPCR and calcium signaling: vipr2, sstr3, adcyap1r1b, avpr2ab, htr7c, oprd1a, ntsr1, pth2ra, trpc4a, cacna1db, cacna1bb, cacna2d1a
+→ These genes fit hormone-responsive endocrine cells with receptor-linked calcium/cAMP signaling. This supports an active pituitary endocrine population rather than structural epithelium or neuronal contamination.
+
+**Decision rule:**
+
+The combination of pituitary developmental transcription factors (pou1f1, lhx3, and pitx3), multiple hormone genes (gh1, prl, and pomca), and neuroendocrine secretory-processing genes (scg3, pcsk2, cpe, ptprn2, snap25b, and stx1a) supports annotation as mixed adenohypophyseal pituitary endocrine cells.
+
+**Distinguishing note:**
+
+This cluster is distinguished from hypothalamic neurons by the pituitary hormone genes gh1, prl, and pomca together with pou1f1,lhx3, and pitx3. It is distinguished from generic neuroendocrine cells by the adenohypophyseal hormone-lineage program. The dominant signal is mixed pituitary endocrine identity.
+
+```{r}
+DotPlot(lSeqNonLB, features = c(
+
+    # Pituitary developmental / adenohypophyseal identity
+    "pou1f1", "lhx3", "pitx3",
+    "six3a", "insm1a", "neurod1",
+
+    # Mixed pituitary hormone lineages
+    "gh1", "prl", "pomca",
+
+    # Neuroendocrine secretory / hormone-processing machinery
+    "scg3", "pcsk2", "cpe", "ptprn2",
+    "baiap3", "rab3da", "rab3db",
+    "snap25b", "stx1a", "cplx2", "doc2b",
+
+    # Pituitary responsiveness / GPCR and calcium signaling
+    "vipr2", "sstr3", "adcyap1r1b", "avpr2ab",
+    "htr7c", "oprd1a", "ntsr1", "pth2ra",
+    "trpc4a", "cacna1db", "cacna1bb", "cacna2d1a"
+
+  )
+) + RotatedAxis()
+```
+### p13: Cranial sensory neurons
+
+**Cluster 20: Pitx2⁺ / Lhx9⁺ cranial sensory neurons**
+
+One-line identity: Cranial sensory ganglion-like neurons, most consistent with epibranchial/visceral sensory neurons, defined by cranial sensory neuronal transcription factors, glutamatergic identity, strong axon-guidance/adhesion genes, and mature synaptic machinery (Andermann et al., 2002; Dam et al., 2011; Y. Liu & Semina, 2012; McGraw et al., 2012; Nechiporuk et al., 2007; Pan et al., 2012).
+ 
+**Key evidence**
+
+• Cranial sensory / epibranchial ganglion context: pitx2, lhx9, lhx1a, scrt2, pou2f2a, fgf8a
+→  This gene combination supports cranial sensory ganglion identity rather than CNS neurons. Cranial sensory neurons in zebrafish arise from cranial placodes (epibranchial/trigeminal), not the neural tube, and are defined by distinct TF programs from CNS neurons. 
+
+• Glutamatergic sensory neuron identity: slc17a6a, grin3ba, gria1a, gria2b, gria3b, gria4b, grin1b, grin2aa, grin2ab, grin2da, grm8a, grm8b
+→ These genes support an excitatory glutamatergic neuronal identity: slc17a6a encodes a vesicular glutamate transporter used to identify glutamatergic neurons in zebrafish, while the AMPA/NMDA/metabotropic glutamate receptor genes support glutamate-responsive sensory neurons. 
+
+• Cranial sensory axon guidance / adhesion program: robo2, unc5da, celsr3, sema4e, cntnap5l, lrrc24, tenm2b, clstn2b, fstl4
+→ These genes support a projection-neuron identity with active axon guidance and sensory-ganglion wiring features: robo2 is expressed in zebrafish trigeminal ganglion sensory neurons and controls subtype-specific axonal projections, while unc5-family genes and semaphorin/cadherin/adhesion genes fit axon pathfinding and target selection.
+
+• Synaptic and mature neuronal machinery: sypa, sypb, vamp2, snap91a, rph3ab, stxbp5a, gap43, dpysl2a, dpysl2b, caskin2
+→ These genes support mature neuronal synaptic/axon-growth identity: gap43 and synaptic vesicle genes are consistent with differentiated sensory neurons rather than placodal epithelium or glia.
+
+• Sensory-modulatory receptor profile: oprl1, npffr2a, qrfprb, adcyap1r1b, gabrg2, gpr183b
+→ These genes support a neuromodulatory sensory-neuron state. They are best treated as supporting evidence for sensory responsiveness and interoceptive/visceral-like modulation, not as primary lineage markers.
+
+**Decision rule:**
+
+The combination of cranial sensory neuronal markers (pitx2, lhx9, lhx1a, scrt2, pou2f2a), glutamatergic identity (slc17a6a and glutamate receptor genes), and a strong axon-guidance/adhesion program (robo2, unc5da, celsr3, sema4e, cntnap5l) supports annotation as Pitx2⁺ / Lhx9⁺ cranial sensory neurons, most consistent with epibranchial/visceral sensory neurons.
+
+**Distinguishing note:**
+
+This cluster is excluded from CNS neuron groups because it lacks any defining CNS regional transcriptional identity and instead expresses a cranial placode–derived sensory neuron program. The dominant signal is peripheral cranial sensory ganglion identity, not central nervous system neuron identity.
+
+```{r}
+DotPlot(lSeqNonLB, features = c(
+
+    # Cranial sensory / epibranchial ganglion context
+    "pitx2", "lhx9", "lhx1a",
+    "scrt2", "pou2f2a", "fgf8a", 
+
+    # Glutamatergic sensory neuron identity
+    "slc17a6a",
+    "grin3ba",
+    "gria1a", "gria2b", "gria3b", "gria4b",
+    "grin1b", "grin2aa", "grin2ab", "grin2da",
+    "grm8a", "grm8b",
+
+    # Cranial sensory axon guidance / adhesion
+    "robo2", "unc5da", "celsr3", "sema4e",
+    "cntnap5l", "lrrc24", "tenm2b", "clstn2b", "fstl4",
+
+    # Synaptic and mature neuronal machinery
+    "sypa", "sypb", "vamp2", "snap91a",
+    "rph3ab", "stxbp5a", "gap43",
+    "dpysl2a", "dpysl2b", "caskin2",
+
+    # Sensory-modulatory receptor profile
+    "oprl1", "npffr2a", "qrfprb",
+    "adcyap1r1b", "gabrg2",  "gpr183b"
+
+  )
+) + RotatedAxis()
+```
+### p14: Hepatocytes
+
+**Cluster p14: Hepatocytes**
+
+One-line identity: Hepatocyte-like / liver-derived population, defined by liver-enriched metabolic transcriptional programs, apolipoprotein/lipid transport genes, plasma/coagulation/complement genes, gluconeogenic and amino-acid metabolism enzymes, and bile/organic-anion transporters (Anderson et al., 2011; Cheng et al., 2006; Gao et al., 2022; Mo et al., 2024; Moll & Farber, 2024).
+ 
+**Key evidence**
+
+• Liver / hepatocyte-enriched metabolic identity: hnf4b, nr5a2, nr1h5, prox1a, onecut2, klf15, foxo1a, pparab
+→ These transcription factors and nuclear receptors support a hepatocyte-like metabolic identity rather than a brain-resident cell type. 
+
+• Hepatocyte lipid transport / liver-enriched markers: fabp10a, gc, bhmt, tfa, foxa3, apoa1b, apoba, apoa2, apoc1, apom, ldlra, slc27a1a, slc27a2a, slc27a6, scp2a, soat2
+→ These genes strongly support liver/hepatocyte identity. Apolipoprotein and fatty-acid transport genes are core zebrafish liver/hepatocyte features and zebrafish liver studies use hepatocyte lipid-transport programs, including apolipoproteins and fatty-acid binding/transport genes, to identify liver-derived cells.
+
+• Plasma proteins, coagulation, and complement: c3b.1, c4b, c5, cfi, f5, f10, fgb, fgg, plg, fetub, ahsg2, itih2
+→ This secreted plasma-protein signature is highly consistent with hepatocytes. The liver is the major source of many coagulation, complement, and circulating plasma proteins. 
+
+• Gluconeogenesis / carbohydrate and amino-acid metabolism: g6pc1a.2, pck1, pck2, gys2, aldob, gnmt, bhmt, mat1a, tat, pah, agxtb, hal, fah, tdo2b
+→ These genes support hepatocyte metabolic function and code for enzymes involved in glucose production, glycogen metabolism, one-carbon/amino-acid metabolism, tyrosine/phenylalanine metabolism, and nitrogen handling.
+
+• Bile acid / organic anion and hepatocyte transporter program: abcb11b, abcc12, slco1d1, slco2a1, slc2a2, slc13a5a, aqp9b, atp7b
+→ These genes support liver transport and hepatocyte-like physiology: abcb11 is a bile salt export transporter, slco genes support organic-anion transport, and slc2a2/aqp9b fit hepatocyte nutrient and small-solute transport. 
+
+**Decision rule:**
+
+The combination of liver metabolic regulators, apolipoprotein/lipid transport genes, plasma/coagulation/complement genes, gluconeogenic and amino-acid metabolism enzymes, and bile/organic-anion transporters supports annotation as hepatocytes / liver-derived cells.
+
+**Distinguishing note:**
+
+This cluster is distinguished from brain-resident cell types by the absence of neuronal, glial, epithelial sensory, immune, or vascular marker programs and by the dominance of hepatocyte functions, such as lipid transport, plasma protein secretion, complement/coagulation production, gluconeogenesis, amino-acid metabolism, and bile/organic-anion transport. The dominant signal is liver-derived hepatocyte contamination, not a larval brain cell type.
+
+```{r}
+DotPlot(lSeqNonLB, features = c(
+
+    # Liver / hepatocyte-enriched metabolic identity
+    "hnf4b", "nr5a2", "nr1h5", "prox1a",
+    "onecut2", "klf15", "foxo1a", "pparab",
+
+    # Hepatocyte lipid transport / liver-enriched markers
+    "fabp10a", "gc", "bhmt", "tfa", "foxa3",
+    "apoa1b", "apoba", "apoa2", "apoc1", "apom",
+    "ldlra", "slc27a1a", "slc27a2a", "slc27a6",
+    "scp2a", "soat2",
+
+    # Plasma proteins, coagulation, and complement
+    "c3b.1", "c4b", "c5", "cfi",
+    "f5", "f10", "fgb", "fgg",
+    "plg", "fetub", "ahsg2", "itih2",
+
+    # Gluconeogenesis / carbohydrate and amino-acid metabolism
+    "g6pc1a.2", "pck1", "pck2", "gys2",
+    "aldob", "gnmt", "mat1a", "tat",
+    "pah", "agxtb", "hal", "fah", "tdo2b",
+
+    # Bile acid / organic anion and hepatocyte transporter program
+    "abcb11b", "abcc12", "slco1d1", "slco2a1",
+    "slc2a2", "slc13a5a", "aqp9b", "atp7b"
+
+  )
+) + RotatedAxis()
+```
+### p15: Mechanosensory hair cells
+
+**Cluster 23: Mechanosensory hair cells**
+
+One-line identity: Mature mechanosensory hair cells from inner ear and/or lateral line, defined by canonical mechanotransduction/tip-link genes, stereocilia myosin and actin-bundle genes, ciliary/kinociliary machinery, and ribbon-synapse neurotransmission genes (Chatterjee et al., 2015; Ebrahim et al., 2016; Fang et al., 2015; Manchanda et al., 2019; Nicolson, 2015; Qian et al., 2022; Shi et al., 2023; Smith et al., 2020, 2023).
+ 
+**Key evidence**
+
+• Mechanotransduction / tip-link machinery: tmc1, tmc2a, tmc2b, cdh23, pcdh15a, pcdh15b, cabp2b, ptprq
+→ These genes support mature hair-cell identity: tmc2a/tmc2b are required for hair-cell mechanotransduction, cdh23 and pcdh15 are tip-link-associated genes, and cabp2b is also expressed in hair cells.
+
+• Stereocilia / hair-bundle structure: myo6b, myo7aa, myo15aa, myo15ab, myo15b, myo3b, espn, whrna, ripor2, ush1c
+→ These genes support the specialized actin-rich hair bundle: myo7aa, myo15, and related stereocilia genes are core hair-cell structural genes and myosin/espin-associated machinery is directly linked to stereocilia organization.  
+
+• Hair-cell ribbon synapse / neurotransmission: otofa, slc17a8, cacna1da, cacna1db, rims2a, rims2b, pcloa, pclob, rab3ab, syt14a
+→ These genes support mature synaptic hair-cell function: otofa is required for hair-cell synaptic function, cacna1da/Cav1.3a is a classic zebrafish hair-cell ribbon-synapse calcium channel, and slc17a8 is part of the zebrafish hair-cell neurotransmission program.  
+
+• Ciliary / kinocilium and axonemal program: dnah5, dnah7, dnah9, dnah9l, dnah2, cfap58, ift172, ift80, ift122, ift140, dync2i1, bbs9, rfx2, pacrg, hydin
+→ These genes support the ciliary/axonemal component of hair-cell sensory architecture, including kinocilium-associated and intraflagellar transport machinery. Zebrafish hair-cell single-cell data identify ciliary and hair-cell structural programs across inner-ear hair-cell subtypes.  
+
+• Otic/lateral-line sensory epithelial context: pax2a, pax2b, eya1, eya4, jag2b, bdnf
+→ These genes support inner-ear/lateral-line sensory-organ context. 
+
+**Decision rule:**
+
+The combination of mechanotransduction genes (tmc2a/tmc2b, cdh23, and pcdh15a/b), stereocilia genes (myo6b, myo7aa, myo15aa/ab/b, espn, and ptprq), ciliary/IFT genes, and ribbon-synapse machinery (otofa, slc17a8, and cacna1da) supports annotation as mature mechanosensory hair cells.
+
+**Distinguishing note:**
+
+This cluster is distinguished from supporting cells by the dominant mechanotransduction, stereocilia, and ribbon-synapse program. It is distinguished from CNS neurons by hair-cell-specific tip-link and stereocilia machinery, especially cdh23, pcdh15a/b, tmc2a/b, myo6b, myo7aa, myo15 genes, espn, ptprq, and otofa. The dominant signal is mature mechanosensory hair-cell identity, not generic neuronal or epithelial identity.
+
+
+```{r}
+DotPlot(lSeqNonLB, features = c(
+
+    # Mechanotransduction / tip-link machinery
+    "tmc1", "tmc2a", "tmc2b",
+    "cdh23", "pcdh15a", "pcdh15b",
+    "cabp2b", "ptprq",
+
+    # Stereocilia / hair-bundle structure
+    "myo6b", "myo7aa",
+    "myo15aa", "myo15ab", "myo15b",
+    "myo3b", "espn", "whrna", "ripor2", "ush1c",
+
+    # Hair-cell ribbon synapse / neurotransmission
+    "otofa", "slc17a8",
+    "cacna1da", "cacna1db",
+    "rims2a", "rims2b",
+    "pcloa", "pclob",
+    "rab3ab", "syt14a",
+
+    # Ciliary / kinocilium and axonemal program
+    "dnah5", "dnah7", "dnah9", "dnah9l", "dnah2",
+    "cfap58",
+    "ift172", "ift80", "ift122", "ift140",
+    "dync2i1", "bbs9", "rfx2", "pacrg", "hydin",
+
+    # Otic / lateral-line sensory epithelial context
+    "pax2a", "pax2b", "eya1", "eya4", "jag2b", "bdnf"
+
+  )
+) + RotatedAxis()
+```
+
+
+## DotPlot Summary
+```{r}
+p <- DotPlot(lSeqNonLB, features =c(
+
+  # =====================
+  # b1 — Meningeal fibroblasts
+  # =====================
+  "pdgfra","col12a1a","col11a1b","tncb","wnt5b",
+
+  # =====================
+  # b2 — BBB endothelium
+  # =====================
+  "flt1","ptprb","vash1","stab1","ly75",
+
+  # =====================
+  # b3 — mLECs
+  # =====================
+  "slc6a13","glulb","gas6","pros1","slc38a2",
+
+  # =====================
+  # b4 — Mural cells
+  # =====================
+  "pdgfrb","notch3","myh11a","abcc9","s1pr2",
+
+  # =====================
+  # b5 — Pineal epithelium
+  # =====================
+  "otx2b","slc6a4a","barhl2","rapgef4a","ror1",
+
+  # =====================
+  # b6 — Choroid plexus epithelium
+  # =====================
+  "clocka","cubn","ace","cd36","slc15a1b",
+
+  # =====================
+  # b7 — Pineal photoreceptors
+  # =====================
+  "rpe65a","rgra","prom1b","oca2","trpm1b",
+
+  # =====================
+  # p1 — Vascular endothelial (lymphatic)
+  # =====================
+  "kdrl","pecam1b","egfl7","dll4","tie1",
+
+  # =====================
+  # p2 — Surface epithelium
+  # =====================
+  "ppl","dsg2.1","evpla","evplb","spint2",
+
+  # =====================
+  # p3 — Branchiomeric muscle
+  # =====================
+  "myog","ryr1a","tnnt3a","colq","dok7b",
+
+  # =====================
+  # p4 — Basal keratinocytes
+  # =====================
+  "col17a1a","itgb4","itga6b","fgfr2","edar",
+
+  # =====================
+  # p5 — Erythrocytes
+  # =====================
+  "alas2","slc4a1a","fech","gpx1a","slc25a37",
+
+  # =====================
+  # p6 — Chondrocytes
+  # =====================
+  "sox9a","col2a1a","acana","hapln1b","fgfr3",
+
+  # =====================
+  # p7 — Olfactory sensory neurons
+  # =====================
+  "gnal","gnb1a","gnao1b","fgf14","stac",
+
+  # =====================
+  # p8 — Skeletal muscle
+  # =====================
+  "ttn.1","neb","myom2b","mybphb","mylpfb",
+
+  # =====================
+  # p9 — Hair cell epithelium
+  # =====================
+  "tfap2a","rorb","abca12","cd109","cfap107",
+
+  # =====================
+  # p10 — Otic sensory epithelium
+  # =====================
+  "otog","otomp","kcnq1.1","ush2a","tectb",
+
+  # =====================
+  # p11 — Schwann cells
+  # =====================
+  "mbpa","mbpb","mag","cldn19","bcas1",
+
+  # =====================
+  # p12 — Pituitary endocrine
+  # =====================
+  "pomca","gh1","prl","insm1a","vipr2",
+
+  # =====================
+  # p13 — Epibranchial visceral sensory neurons
+  # =====================
+  "robo2","celsr3","gabrg2","sema4e","myt1la",
+
+  # =====================
+  # p14 — Hepatocytes
+  # =====================
+  "apoa1b","apom","igfbp1a","ucp1","ahcy",
+
+  # =====================
+  # p15 — Mechanosensory hair cells
+  # =====================
+  "otofa","pcdh15a","kcnn2","bdnf","tmc2b"
+
+          ),
+        dot.scale = 4, scale.min=10, scale.max=80) +
+  theme(panel.background = element_rect(fill="white")) +
+  #ggtitle("markers") +
+  coord_flip() +
+  theme(plot.title = element_text(color="black", size=12, face="plain"),
+        axis.title.x= element_text(size=10),#element_blank(),
+       # axis.text.x = element_text(size=10, angle = 45, face="italic"),
+        axis.title.y= element_text(size=10), element_blank(),#
+        axis.text.y = element_text(size=10, angle = 0),
+        legend.title = element_text(size=10),
+        legend.text = element_text(size=10),
+        panel.grid.major = element_line(color = "gray90"),
+        panel.border = element_rect(colour = "black", fill=NA, size=0.5))+
+  ylab('') +
+  theme(axis.line  = element_blank()) +
+  labs(x ="Genes", y = "Cell type")+
+  theme(axis.ticks =element_line(colour = "black", size=0.5)) +
+  scale_colour_gradient(low = "#f2e5ff", high = "#4d0099", limits = c(0,3), oob = scales::squish) +
+  guides(fill = guide_legend(title.position = "left"))
+
+print(p)
+ggsave("NonAll_top5.pdf", p, width = 12, height = 18, dpi = 300)
+```
+# . CNS/brain only cell types
+## Relabel object
+```{r}
+lSeqNonCF <- lSeqNon
+
+# Named vector for relabeling clusters
+cluster_labels <- data.frame(
+  cluster = 0:24,
+  celltype = c(
+    "b1", #0  "Miningeal fibro"
+    "b2",  #1 "BBB endothelium"
+    "contamination", #2
+    "b3", #3 "mLECs"
+    "contamination", #4
+    "contamination", #5
+    "contamination", #6
+    "contamination", #7
+    "contamination", #8
+    "b1", #9 "Miningeal fibro"
+    "contamination", #10
+    "contamination", #11
+     "contamination", #12
+    "contamination", #13
+    "b4",  #14 "Mural Cells"
+    "contamination", #15
+     "contamination", #16
+     "contamination", #17
+    "b5", #18 "Pineal epithelium"
+    "b6", #19 "Choroid plexus epithelium"
+    "contamination", #20
+    "b7", #21 "Pineal Photoreceptors"
+    "contamination", #22
+    "contamination",  #23
+    "contamination" #24
+  
+  )
+)
+
+# Convert Idents to numeric or character to match cluster_labels
+cluster_ids <- as.numeric(as.character(Idents(lSeqNonCF)))
+
+# Join the labels
+lSeqNonCF$celltype <- cluster_labels$celltype[match(cluster_ids, cluster_labels$cluster)]
+Idents(lSeqNonCF) <- lSeqNonCF$celltype
+
+
+Idents(lSeqNonCF) <- factor(
+  Idents(lSeqNonCF),
+  levels = c("b1","b2","b3","b4","b5","b6","b7")
+)
+
+lSeqNonCF$celltype <- Idents(lSeqNonCF)
+
+#lSeqNonCF$population <- factor(lSeqNonCF$population, levels = c("surface", "cave"))
+
+cells_use <- WhichCells(
+  lSeqNonCF,
+  idents = setdiff(levels(Idents(lSeqNonCF)), 
+                   c("contamination"))
+)
+
+lSeqNonCF_sub <- subset(
+  lSeqNonCF,
+  cells = cells_use
+)
+```
+
+## plot 
+```{r}
+
+DimPlot(lSeqNonCF_sub, reduction = "umap",label = TRUE, pt.size = 0.25) + NoLegend()
+
+#ggsave("lSeqNonCF.pdf", width = 10, height = 8, dpi = 300)
+
+```
+
+## . Cell type proportions (percent composition) by population
+```{r}
+res <- run_prop_glm_and_plot(
+  denom_obj = lSeqNonCF_sub,
+  group_var = "celltype",
+  glm_family = "auto",
+  overdisp_cut = 1.5,
+  bar_error = "sem",
+  overlay_points = FALSE
+)
+
+res$plot_bar
+res$glm_effects
+
+#ggsave("lSeqNonCF_sub_Props_bySample.pdf", res$plot_bar, width = 10, height = 8, dpi = 300)
+#write.csv(res$glm_effects, "lSeqNonCF_sub_glm.csv", row.names = FALSE)
+```
+
+# . Pineal photoreceptors
+## Annotation support - pineal not retina contamination
+```{r}
+DotPlot(lSeqNonCF_sub,
+        features = rev(c(
+          
+        # Melatonin synthesis
+        "asmt",
+        
+        # Non-visual / extraocular opsins (photoreception)
+        "opn4b","opn7b","opn5",
+        
+        # Phototransduction regulation / interphotoreceptor matrix
+        "rgs9a","impg1b",
+        
+        # Visual cycle (retinoid metabolism; RPE/Müller-associated)
+        "rpe65a","rdh5","rlbp1b",
+        
+        # Pigment / photoreceptor lineage transcription
+        "pmela","otx5",
+        
+        # Retinal cell-type / phototransduction markers
+        "vsx2","gnat1","pde6a","pde6b","nr2e3","atoh7","pou4f2",
+        
+        # Neuronal differentiation / mature neurons
+        "elavl4"
+         
+        )
+      ),
+    #scale.min=10, scale.max=80,
+        dot.scale = 4) +
+  theme(panel.background = element_rect(fill="white")) +
+  #ggtitle("markers") +
+  coord_flip() +
+  theme(plot.title = element_text(color="black", size=12, face="plain"),
+      #  axis.title.x= element_text(size=10),#element_blank(),
+        axis.text.x = element_text(size=10, angle = 45, face="italic"),
+        axis.title.y= element_text(size=10), element_blank(),#
+        axis.text.y = element_text(size=10, angle = 0),
+        legend.title = element_text(size=10),
+        legend.text = element_text(size=10),
+        panel.grid.major = element_line(color = "gray90"),
+        panel.border = element_rect(colour = "black", fill=NA, size=0.5))+
+  ylab('') +
+  theme(axis.line  = element_blank()) +
+  labs(x ="Genes", y = "Cell type")+
+  theme(axis.ticks =element_line(colour = "black", size=0.5)) +
+  scale_colour_gradient(low = "#f2e5ff", high = "#4d0099", limits = c(0,1), oob = scales::squish) +
+  guides(fill = guide_legend(title.position = "left"))
+
+#ggsave("photodottop10.pdf", width = 6, height = 4, dpi = 300)
+```
+
+## Population DEGs (surface vs cave)
+```{r}
+pb <- AggregateExpression(
+  lSeqNonLB,
+  assays        = "RNA",
+  slot          = "counts",
+  group.by      = c("population", "sample_id", "celltype"),
+  return.seurat = TRUE
+)
+
+cts <- GetAssayData(pb, assay = "RNA", layer = "counts")
+
+coldata <- pb@meta.data %>%
+  tibble::rownames_to_column("col_id") %>%     # rownames are the pseudo-bulk column IDs
+  transmute(
+    col_id     = col_id,
+    sample     = sample_id,
+    Population = factor(population, levels = c("surface", "cave")),
+    CellType   = celltype
+  )
+```
+
+```{r}
+photo_out <- deseq2_pb_celltype(cts, coldata, "b7", fdr_explore = 0.05)
+
+res_photo <- photo_out$res_all
+dds_photo <- photo_out$dds
+```
+
+### volcano check
+```{r}
+res_df <- res_photo %>%
+   mutate(
+    padj = as.numeric(padj),
+    log2FoldChange_shrunk = as.numeric(log2FoldChange_shrunk),
+    logP = -log10(pmax(padj, .Machine$double.xmin)),  # avoid Inf
+    significance = dplyr::case_when(
+      padj < 0.05 & log2FoldChange_shrunk >  1 ~ "Up in Cave",
+      padj < 0.05 & log2FoldChange_shrunk < -1 ~ "Up in Surface",
+      TRUE ~ "Not significant"
+    )
+  )
+
+ggplot(res_df, aes(x = log2FoldChange_shrunk, y = logP, color = significance)) +
+  geom_point(alpha = 0.7, size = 3) +
+  scale_color_manual(values = c(
+    "Up in Cave" = "palevioletred",
+    "Up in Surface" = "darkseagreen3",
+    "Not significant" = "lightgray"
+  )) +
+  geom_vline(xintercept = c(-1, 1), linetype = "dashed", color = "gray50") +
+  geom_hline(yintercept = -log10(0.05), linetype = "dashed", color = "gray50") +
+  labs(
+    title = "Volcano Plot: Cave vs Surface (photo)",
+    x = "Shrunken log2 Fold Change (Cave vs Surface)",
+    y = "-log10 Adjusted p-value",
+    color = "DE Category"
+  ) +
+  theme_minimal(base_size = 14) +
+  theme(panel.grid.minor = element_blank())
+
+
+#ggsave("photoVolc.pdf", width = 10, height = 8, dpi = 300)
+```
+
+### annotate degs
+add entrez id column GeneID
+```{r}
+res_df <- res_df %>% left_join(gene_map, by = c("gene" = "gene_symbol")) 
+#head(res_df)
+```
+
+create output file for DAVID Gene ID Conversion
+```{r}
+# keep only rows marked as significant and map to existing gene annotations
+sig_res <- res_df %>%
+  filter(significance != "Not significant") 
+  
+# export entrez IDs to text file
+#write.table(sig_res$GeneID, "photoDavid.txt", row.names = FALSE, col.names = FALSE, quote = FALSE)
+```
+
+import from DAVID
+```{r}
+# # Read Astyanax DAVID file
+# david_asty <- read.delim("photoDAVIDnew.txt", sep = "\t", header = TRUE, stringsAsFactors = FALSE)
+# 
+# # Rename column
+# david_asty <- david_asty  %>%
+#   dplyr::rename(GeneID = From) %>%
+#   mutate(GeneID = as.character(GeneID)) 
+# 
+# 
+# # Join to annotated degs to sig_res on GeneID
+# sig_res <- left_join(sig_res , david_asty, by = "GeneID")
+# 
+# # Add unannotatable GeneIDs back in
+# sig_res <- sig_res %>%
+#    mutate(GeneID = as.character(GeneID)) %>%
+#    mutate(final_gene_symbol = case_when(
+#      !is.na(To) ~ To,
+#      !is.na(GeneID) ~ paste0("LOC", GeneID),
+#      TRUE ~ gene)
+#    ) 
+# 
+# # Remove extraneous columns
+# sig_res <- sig_res %>% 
+#   dplyr::select(-c(To)) %>%
+#   dplyr::distinct() #remove duplicated gene rows from ortholog 
+# 
+# 
+# head(sig_res)
+```
+export
+```{r}
+# write.csv(sig_res, file = "photo.de.pseudo.david.csv",
+#               row.names = FALSE)
+```
+
+### Functional dot plot of DEGs
+There were no significant KEGG or GO enrichment categories for this cell type so genes were grouped by functional category
+```{r}
+plot_pineal_photo_deg_dot <- function(
+  res_all,
+  title = "Pineal epithelial photoreceptors: Cave vs Surface DEGs",
+  gene_col = c("final_gene_symbol","gene","Gene.Name"),
+  lfc_col  = c("log2FoldChange_shrunk","log2FoldChange","lfc"),
+  padj_col = c("padj","p_val_adj","pvalue","p_val"),
+  direction_col = c("significance","direction"),
+  only_sig = FALSE,
+  padj_cut = 0.05,
+  lfc_cut  = 0.5,
+  top_n_per_group = 30,                 # figure density control
+  drop_LOC = TRUE,
+  loc_regex = "^LOC",
+  colour_mode = c("viridis_abs","signed"),
+  viridis_limits = c(0, 4),
+  signed_limits  = c(-4, 4)
+) {
+  suppressPackageStartupMessages({
+    library(dplyr)
+    library(ggplot2)
+    library(patchwork)
+    library(scales)
+    library(tibble)
+  })
+
+  colour_mode <- match.arg(colour_mode)
+
+  # pick existing cols
+  gene_col <- gene_col[gene_col %in% names(res_all)][1]
+  lfc_col  <- lfc_col[lfc_col %in% names(res_all)][1]
+  padj_col <- padj_col[padj_col %in% names(res_all)][1]
+  direction_col <- direction_col[direction_col %in% names(res_all)][1]
+
+  if (is.na(gene_col)) stop("No gene column found in res_all.")
+  if (is.na(lfc_col) && is.na(direction_col)) stop("Need either LFC column or significance/direction column.")
+
+  # build base
+  df <- res_all %>%
+    mutate(gene_label = as.character(.data[[gene_col]])) %>%
+    { if (drop_LOC) filter(., !grepl(loc_regex, gene_label)) else . } %>%
+    mutate(
+      lfc = if (!is.na(lfc_col)) as.numeric(.data[[lfc_col]]) else NA_real_,
+      Group = case_when(
+        !is.na(direction_col) & grepl("Up in Cave", .data[[direction_col]], ignore.case = TRUE)    ~ "Cave",
+        !is.na(direction_col) & grepl("Up in Surface", .data[[direction_col]], ignore.case = TRUE) ~ "Surface",
+        is.na(direction_col) & !is.na(lfc) & lfc >= 0 ~ "Cave",
+        is.na(direction_col) & !is.na(lfc) & lfc <  0 ~ "Surface",
+        TRUE ~ NA_character_
+      ),
+      abs_lfc = ifelse(!is.na(lfc), abs(lfc), NA_real_)
+    ) %>%
+    filter(!is.na(Group))
+
+  # padj for dot size (if present)
+  if (!is.na(padj_col)) {
+    df <- df %>%
+      mutate(
+        padj = as.numeric(.data[[padj_col]]),
+        neglog10padj = -log10(pmax(padj, .Machine$double.xmin))
+      )
+  } else {
+    df$padj <- NA_real_
+    df$neglog10padj <- 1
+  }
+
+  # optional sig filter
+  if (isTRUE(only_sig) && !is.na(padj_col)) {
+    df <- df %>%
+      filter(!is.na(padj), padj < padj_cut) %>%
+      { if (!is.na(lfc_col)) filter(., abs_lfc >= lfc_cut) else . }
+  }
+
+  
+  # ------------------------------------------------------------
+  # RULE-BASED functional annotation - unannotated genes excluded
+  # ------------------------------------------------------------
+ 
+   df <- df %>%
+    mutate(
+      Func = case_when(
+        # Phototransduction / chromophore / retinoid cycle
+        grepl("^(opn|gnat|gngt|pde6|cnga|cngb|grk|arr|sag|rpe65|rlbp|lrat|rdh|rbp|rgr)", gene_label, ignore.case = TRUE) ~
+          "Phototransduction / retinoid",
+
+        # Phosphoinositide / PIP metabolism
+        grepl("(pip5k|pi4k|pip4p|inpp5|pitpn|dgk)", gene_label, ignore.case = TRUE) ~
+          "Phosphoinositide signaling",
+
+        # MAPK / kinase signaling
+        grepl("(mapk|map3k|mknk|brsk|jnk|erk|tnika|jakmip)", gene_label, ignore.case = TRUE) ~
+          "MAPK / kinase signaling",
+
+        # Ion channels / fast excitability coupling
+        grepl("^(kcn|scn|cacna|chrn|gnaz$|prkar)", gene_label, ignore.case = TRUE) ~
+          "Fast signaling / excitability",
+
+        # ECM / adhesion / matrix
+        grepl("^(col|lama|lamc|thbs|matn|ccn|adamts|hs\\d|usta)", gene_label, ignore.case = TRUE) ~
+          "ECM / matrix / adhesion",
+
+        # Guidance / wiring (ephrins, semas, slit, ryk, etc.)
+        grepl("^(sema|slit|eph|efna|cadm|cdh|igsf|lgr|gpc|nrp|unc5|plxn|ryk)", gene_label, ignore.case = TRUE) ~
+          "Guidance / wiring",
+
+        # Cytoskeleton / trafficking (general)
+        grepl("(map\\d|nav\\d|cep\\d|syne\\d|tmod|limch|afap|plec|dbn|kank|klc|dync)", gene_label, ignore.case = TRUE) ~
+          "Cytoskeleton / trafficking",
+
+        # Myosin / actin machinery / stereocilia-related
+        grepl("^(myo|myrip|espn)", gene_label, ignore.case = TRUE) ~
+          "Myosin / actin machinery",
+
+        # Lipid droplets / lipid handling
+        grepl("^(plin|bscl2|acsl|tm6sf|scarb|pltp|pnpla|bco2)", gene_label, ignore.case = TRUE) ~
+          "Lipid handling / droplets",
+
+        # Metabolism / mitochondrial state
+        grepl("(ppargc|gls\\d|pcx|bcat|mocos|aox\\d|cyb561|slc\\d)", gene_label, ignore.case = TRUE) ~
+          "Metabolism / transport",
+
+        # Pigmentation / melanosome
+        grepl("^(mlana|oca2|pmel|dct|tfec)", gene_label, ignore.case = TRUE) ~
+          "Pigmentation / melanosome",
+
+        # Immune / myeloid-like
+        grepl("^(csf1r|il\\d|scara|scarf|coro1c)", gene_label, ignore.case = TRUE) ~
+          "Immune-associated",
+
+        TRUE ~ NA_character_
+      )
+    ) %>%
+    filter(!is.na(Func))  # enforce: all plotted genes have a functional category
+
+  # set ordering
+  func_levels <- c(
+    "Phototransduction / retinoid",
+    "Phosphoinositide signaling",
+    "MAPK / kinase signaling",
+    "Fast signaling / excitability",
+    "Guidance / wiring",
+    "ECM / matrix / adhesion",
+    "Cytoskeleton / trafficking",
+    "Myosin / actin machinery",
+    "Lipid handling / droplets",
+    "Metabolism / transport",
+    "Pigmentation / melanosome",
+    "Immune-associated"
+  )
+
+  df <- df %>%
+    mutate(
+      Group = factor(Group, levels = c("Cave","Surface")),
+      Func  = factor(Func, levels = func_levels)
+    ) %>%
+    group_by(Group) %>%
+    { if (!is.null(top_n_per_group)) {
+        if (!is.na(padj_col)) slice_head(arrange(., padj, desc(abs_lfc)), n = top_n_per_group)
+        else slice_head(arrange(., desc(abs_lfc)), n = top_n_per_group)
+      } else . } %>%
+    ungroup() %>%
+    arrange(Group, Func, desc(abs_lfc), if (!is.na(padj_col)) padj else Inf) %>%
+    mutate(gene_label = factor(gene_label, levels = rev(unique(gene_label))))
+
+  # colors for Func strip
+  func_cols <- c(
+    "Phototransduction / retinoid"     = "#3C5488",
+    "Phosphoinositide signaling"       = "#E64B35",
+    "MAPK / kinase signaling"          = "#F39B7F",
+    "Fast signaling / excitability"    = "#B24745",
+    "Guidance / wiring"                = "#5E3C99",
+    "ECM / matrix / adhesion"          = "#00A087",
+    "Cytoskeleton / trafficking"       = "#8491B4",
+    "Myosin / actin machinery"         = "#DC0000",
+    "Lipid handling / droplets"        = "#D4A72C",
+    "Metabolism / transport"           = "#2E8B57",
+    "Pigmentation / melanosome"        = "#7E6148",
+    "Immune-associated"                = "#6A6599"
+  )
+
+  # main dot
+  dot_main <- ggplot(df, aes(x = Group, y = gene_label)) +
+    geom_point(
+      aes(
+        size  = neglog10padj,
+        colour = if (colour_mode == "viridis_abs") abs_lfc else lfc
+      ),
+      alpha = 0.9
+    ) +
+    labs(title = title, x = NULL, y = NULL) +
+    theme_bw(base_size = 12) +
+    theme(panel.grid.major.x = element_blank()) +
+    scale_size_continuous(name = expression(-log[10](padj)))
+
+  if (colour_mode == "viridis_abs") {
+    dot_main <- dot_main +
+      scale_colour_viridis_c(
+        name = "|log2FC|",
+     #   limits = c(0,2),
+        limits = viridis_limits,
+        oob = scales::squish
+      )
+  } else {
+    dot_main <- dot_main +
+      scale_colour_gradient2(
+        name = "log2FC (Cave vs Surface)",
+        midpoint = 0,
+        limits = signed_limits,
+        oob = scales::squish
+      )
+  }
+
+  # functional strip
+  strip <- ggplot(df, aes(x = 1, y = gene_label, fill = Func)) +
+    geom_tile() +
+    scale_fill_manual(values = func_cols, drop = FALSE) +
+    theme_void() +
+    theme(legend.position = "none")
+
+  p <- dot_main + strip +
+    patchwork::plot_layout(widths = c(4, 0.65), guides = "collect") &
+    theme(legend.position = "bottom")
+
+  list(plot = p, df_plot = df)
+}
+
+## Example:
+## out <- plot_pineal_photo_deg_dot(pineal_photo_degs, top_n_per_group = 35, colour_mode = "viridis_abs")
+## out$plot
+## out$df_plot
+```
+
+
+```{r}
+out <- plot_pineal_photo_deg_dot(sig_res, top_n_per_group = 20, colour_mode = "viridis_abs",  viridis_limits = c(0, 8))
+out$plot
+out$df_plot
+
+#ggsave("PhotoDEGDot.pdf", out$plot, width = 7.5, height = 10, dpi = 300)
+```
+
+## Pineal photoreceptor subset
+```{r}
+photo <- subset(lSeqNonCF_sub, idents = "b7")
+photo$population <- factor(photo$population, levels = c("surface", "cave"))
+
+Idents(photo) <- "population"
+```
+### plot for figure
+```{r}
+# base plot cropped to pineal range
+U <- Embeddings(lSeqNonCF_sub, "umap")[Cells(photo), , drop = FALSE]
+pad <- 1
+xlim_use <- range(U[,1]) + c(-pad, pad)
+ylim_use <- range(U[,2]) + c(-pad, pad)
+
+p <- DimPlot(
+  photo, reduction = "umap",
+  group.by = "population",
+  cols = c("darkseagreen3", "palevioletred"),
+  shuffle = TRUE, pt.size = 3
+) +
+  coord_fixed() +
+  xlim(xlim_use) +
+  ylim(ylim_use)
+
+# Remove axes but turn off clipping
+p_clean <- p +
+  theme_void() +
+  coord_cartesian(clip = "off") +
+  theme(
+    plot.margin = margin(20, 20, 20, 20)  # increase if labels get cut off
+  )
+
+# Compute ranges AFTER cropping (so arrows scale correctly)
+gb <- ggplot_build(p_clean)
+x_rng <- gb$layout$panel_params[[1]]$x.range
+y_rng <- gb$layout$panel_params[[1]]$y.range
+x_span <- diff(x_rng)
+y_span <- diff(y_rng)
+
+# Position + sizing of the corner axis
+axis_frac <- 0.20   # length of each axis as fraction of plot range (tune)
+pad_frac  <- 0.08   # inset from corner (tune)
+
+x0 <- x_rng[1] + pad_frac * x_span
+y0 <- y_rng[1] + pad_frac * y_span
+dx <- axis_frac * x_span
+dy <- axis_frac * y_span
+
+# Styling
+lw <- 1.4
+arrow_len <- unit(4, "mm")
+label_size <- 7  # ggplot text size units
+
+p_final <- p_clean +
+  # X axis with arrow
+  annotate(
+    "segment",
+    x = x0, xend = x0 + dx,
+    y = y0, yend = y0,
+    linewidth = lw,
+    lineend = "square",
+    arrow = arrow(type = "closed", length = arrow_len)
+  ) +
+  # Y axis with arrow
+  annotate(
+    "segment",
+    x = x0, xend = x0,
+    y = y0, yend = y0 + dy,
+    linewidth = lw,
+    lineend = "square",
+    arrow = arrow(type = "closed", length = arrow_len)
+  ) +
+  # Labels
+  annotate(
+    "text",
+    x = x0 + dx * 0.55, y = y0 - 0.05 * y_span,
+    label = "UMAP 1",
+    size = label_size, fontface = "bold", vjust = 1
+  ) +
+  annotate(
+    "text",
+    x = x0 - 0.06 * x_span, y = y0 + dy * 0.55,
+    label = "UMAP 2",
+    angle = 90,
+    size = label_size, fontface = "bold", hjust = 1
+  )
+
+p_final
+
+#ggsave("photoUMAPcords.pdf", plot = p_final, width = 10, height = 10, dpi = 300)
+```
+### Surface vs cave module Scoring of DEG gene sets
+prep
+```{r}
+# Ensure population order
+photo$population <- factor(photo$population, levels = c("surface","cave"))
+
+# Use population as identity for the dot plots
+Idents(photo) <- "population"
+```
+
+#### phototransduction / retinoid cycle machinery
+genes
+```{r}
+phototransduction_genes <- c(
+  "rpe65a", "rdh5", "rdh8a", "rlbp1b", "lratb.2",
+  "rbp5", "rbp4l", "rgrb", "slc24a4a", "impg1b"
+)
+```
+Dot plot
+```{r}
+p_phototransduction <- DotPlot(
+  photo,
+  features = rev(phototransduction_genes), 
+  scale = FALSE,
+  assay = DefaultAssay(photo)
+) +
+  scale_color_gradient(
+    low = "#f2e5ff",
+    high = "#4d0099",
+    oob = scales::squish,
+    limits = c(0, 1),
+    name = "avg.exp"
+  ) +
+  coord_flip() +
+  theme_bw(base_size = 12) +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1)) +
+  labs(x = NULL, y = NULL, title = "Phototransduction / retinoid cycle (core machinery)")
+
+p_phototransduction
+```
+Module Scoring
+```{r}
+photo <- AddModuleScore(photo, features = list(phototransduction_genes), name = "PhotoModule")
+
+p_vln_photo <- VlnPlot(photo, features = "PhotoModule1", group.by = "population", pt.size = 0,
+                        cols = c("surface" = "darkseagreen3", "cave" = "palevioletred")) +
+  theme_bw(base_size = 12) + labs(title = "Module score: Phototransduction/retinoid")
+
+p_vln_photo
+```
+#### Fast/excitability vs intracellular/metabolic signaling
+Genes
+```{r}
+fast_response_genes <- c(
+  "kcnq5b", "kcnip1b", "scn4ab", "prkar1b", "gnaz"
+)
+
+intracellular_state_genes <- c(
+  "pip5k1ba", "pi4kab", "pip4p2", "inpp5ka", "inpp5kb",
+  "mapk14b", "map3k10", "mknk2b",
+  "ppargc1b", "gls2b", "pcxb"
+)
+
+
+# Combine as two blocks 
+mode_shift_genes <- c(fast_response_genes, intracellular_state_genes)
+```
+Dot plot
+```{r}
+p_modes <- DotPlot(
+  photo,
+  features = rev(mode_shift_genes),
+  assay = DefaultAssay(photo)
+) +
+  scale_color_gradient(
+    low = "#f2e5ff",
+    high = "#4d0099",
+    oob = scales::squish,
+    limits = c(0, 1),
+    name = "avg.exp"
+  ) +
+  coord_flip() +
+  theme_bw(base_size = 12) +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1)) +
+  labs(x = NULL, y = NULL, title = "Response mode markers: fast/excitability vs intracellular/metabolic") +
+  # visual divider between blocks
+  geom_hline(
+    yintercept = length(intracellular_state_genes) + 0.5,
+    linewidth = 0.6
+  )
+
+p_modes
+```
+Module scoring
+```{r}
+modules <- list(
+  FastResponse      = fast_response_genes,
+  Intracellular     = intracellular_state_genes
+)
+
+set.seed(1)
+# AddModuleScore wants a list-of-vectors; it returns <name>1, <name>2, ...
+photo <- AddModuleScore(photo, features = list(modules$FastResponse),      name = "FastModule")
+photo <- AddModuleScore(photo, features = list(modules$Intracellular),     name = "IntraModule")
+
+# Violin plots by population
+p_vln_fast <- VlnPlot(photo, features = "FastModule1", group.by = "population", pt.size = 0,
+                                              cols = c("surface" = "darkseagreen3", "cave" = "palevioletred")) +
+  theme_bw(base_size = 12) + labs(title = "Module score: Fast/excitability")
+
+p_vln_intra <- VlnPlot(photo, features = "IntraModule1", group.by = "population", pt.size = 0,
+                                               cols = c("surface" = "darkseagreen3", "cave" = "palevioletred")) +
+  theme_bw(base_size = 12) + labs(title = "Module score: Intracellular/metabolic")
+
+p_vln_fast
+p_vln_intra
+
+# ggsave("PhotoViolinFast.pdf", p_vln_fast, width = 7.5, height = 10, dpi = 300)
+# ggsave("PhotoViolinIntra.pdf", p_vln_intra, width = 7.5, height = 10, dpi = 300)
+```
+
+#### Stats - sample level
+```{r}
+score_cols <- c("PhotoModule1", "FastModule1", "IntraModule1")
+
+# Pull per-cell data including sample_id
+df_sample <- FetchData(
+  photo,
+  vars = c("population", "sample_id", score_cols)
+) %>%
+  mutate(
+    population = factor(population, levels = c("surface","cave"))
+  )
+
+
+# Collapse to SAMPLE level (mean per sample)
+df_sample_means <- df_sample %>%
+  group_by(sample_id, population) %>%
+  summarise(
+    across(all_of(score_cols), \(x) mean(x, na.rm = TRUE)),
+    .groups = "drop"
+  ) %>%
+  pivot_longer(
+    cols = all_of(score_cols),
+    names_to = "module",
+    values_to = "mean_score"
+  )
+
+print(df_sample_means)
+
+# Helper effect sizes (sample-level)
+cliffs_delta <- function(x, y) {
+  outer_cmp <- outer(x, y, FUN = "-")
+  (sum(outer_cmp > 0) - sum(outer_cmp < 0)) / (length(x) * length(y))
+}
+
+cohens_d <- function(x, y) {
+  nx <- length(x); ny <- length(y)
+  sp <- sqrt(((nx - 1)*var(x) + (ny - 1)*var(y)) / (nx + ny - 2))
+  (mean(x) - mean(y)) / sp
+}
+
+
+# Statistical test across samples
+sample_tests <- df_sample_means %>%
+  group_by(module) %>%
+  summarise(
+    n_surface = sum(population == "surface"),
+    n_cave    = sum(population == "cave"),
+    mean_surface = mean(mean_score[population == "surface"]),
+    mean_cave    = mean(mean_score[population == "cave"]),
+    wilcox_p = wilcox.test(mean_score ~ population, exact = FALSE)$p.value,
+    t_p      = t.test(mean_score ~ population)$p.value,
+    cliffs_delta = cliffs_delta(
+      mean_score[population == "surface"],
+      mean_score[population == "cave"]
+    ),
+    cohens_d = cohens_d(
+      mean_score[population == "surface"],
+      mean_score[population == "cave"]
+    ),
+    .groups = "drop"
+  ) %>%
+  mutate(
+    wilcox_p_adj = p.adjust(wilcox_p, method = "BH"),
+    t_p_adj      = p.adjust(t_p, method = "BH")
+  )
+
+print(sample_tests)
+
+# Optional export
+# write.csv(sample_tests, "pineal_module_sample_level_stats.csv", row.names = FALSE)
+```
+
+
+# . References
+
+Alvers, A. L., Ryan, S., Scherz, P. J., Huisken, J., & Bagnat, M. (2014). Single continuous lumen formation in the zebrafish gut is mediated
+  by smoothened-dependent tissue remodeling. Development (Cambridge), 141(5). https://doi.org/10.1242/dev.100313
+
+Andermann, P., Ungos, J., & Raible, D. W. (2002). Neurogenin1 defines zebrafish cranial sensory ganglia precursors. Developmental Biology,
+  251(1). https://doi.org/10.1006/dbio.2002.0820
+
+Anderson, J. L., Carten, J. D., & Farber, S. A. (2011). Zebrafish Lipid Metabolism: From Mediating Early Patterning to the Metabolism of
+  Dietary Fat and Cholesterol. In Methods in Cell Biology (Vol. 101). https://doi.org/10.1016/B978-0-12-387036-0.00005-0
+
+Ando, K., Ishii, T., & Fukuhara, S. (2021). Zebrafish vascular mural cell biology: Recent advances, development, and functions. In Life
+  (Vol. 11, Number 10). https://doi.org/10.3390/life11101041
+
+Baas, D., Malbouyres, M., Haftek-Terreau, Z., Le Guellec, D., & Ruggiero, F. (2009). Craniofacial cartilage morphogenesis requires zebrafish
+  col11a1 activity. Matrix Biology, 28(8). https://doi.org/10.1016/j.matbio.2009.07.004
+
+Banerjee, P., Joly, P., Jouneau, L., Jaszczyszyn, Y., Bourge, M., Affaticati, P., Levraud, J. P., Boudinot, P., & Joly, J. S. (2022).
+  Molecular and Cellular Analysis of the Repair of Zebrafish Optic Tectum Meninges following Laser Injury. Cells, 11(13).
+  https://doi.org/10.3390/cells11132016
+
+Bergboer, J. G. M., Wyatt, C., Austin-Tse, C., Yaksi, E., & Drummond, I. A. (2018). Assaying sensory ciliopathies using calcium biosensor
+  expression in zebrafish ciliated olfactory neurons. Cilia, 7(1). https://doi.org/10.1186/s13630-018-0056-1
+
+Bonkhofer, F., Rispoli, R., Pinheiro, P., Krecsmarik, M., Schneider-Swales, J., Tsang, I. H. C., de Bruijn, M., Monteiro, R., Peterkin, T.,
+  & Patient, R. (2019). Blood stem cell-forming haemogenic endothelium in zebrafish derives from arterial endothelium. Nature
+  Communications, 10(1). https://doi.org/10.1038/s41467-019-11423-2
+
+Calvo-Ochoa, E., Byrd-Jacobs, C. A., & Fuss, S. H. (2021). Diving into the streams and waves of constitutive and regenerative olfactory
+  neurogenesis: insights from zebrafish. In Cell and Tissue Research (Vol. 383, Number 1). https://doi.org/10.1007/s00441-020-03334-2
+
+Chatterjee, P., Padmanarayana, M., Abdullah, N., Holman, C. L., LaDu, J., Tanguay, R. L., & Johnson, C. P. (2015). Otoferlin Deficiency in
+  Zebrafish Results in Defects in Balance and Hearing: Rescue of the Balance and Hearing Phenotype with Full-Length and Truncated Forms of
+  Mouse Otoferlin. Molecular and Cellular Biology, 35(6). https://doi.org/10.1128/mcb.01439-14
+
+Chen, C., Lu, M., Lin, S., & Qin, W. (2020). The nuclear gene rpl18 regulates erythroid maturation via JAK2-STAT3 signaling in zebrafish
+  model of Diamond–Blackfan anemia. Cell Death and Disease, 11(2). https://doi.org/10.1038/s41419-020-2331-5
+
+Chen, W., Jiang, H., Wang, C., Ding, Z., Yu, D., Liu, Y., He, S., & Yang, L. (2025). Single-cell RNA sequencing of zebrafish olfactory
+  epithelium reveals cellular heterogeneity and responses to a conspecific alarm substance. Water Biology and Security, 4(2).
+  https://doi.org/10.1016/j.watbs.2024.100324
+
+Cheng, W., Guo, L., Zhang, Z., Soo, H. M., Wen, C., Wu, W., & Peng, J. (2006). HNF factors form a network to regulate liver-enriched genes
+  in zebrafish. Developmental Biology, 294(2). https://doi.org/10.1016/j.ydbio.2006.03.018
+
+Chong, J. X., Talbot, J. C., Teets, E. M., Previs, S., Martin, B. L., Shively, K. M., Marvin, C. T., Aylsworth, A. S., Saadeh-Haddad, R.,
+  Schatz, U. A., Inzana, F., Ben-Omran, T., Almusafri, F., Al-Mulla, M., Buckingham, K. J., Harel, T., Mor-Shaked, H., Radhakrishnan, P., 
+  Girisha, K. M., … Bamshad, M. J. (2020). Mutations in MYLPF Cause a Novel Segmental Amyoplasia that Manifests as Distal Arthrogryposis.
+  American Journal of Human Genetics, 107(2). https://doi.org/10.1016/j.ajhg.2020.06.014
+
+Colijn, S., Nambara, M., Malin, G., Sacchetti, E. A., & Stratman, A. N. (2024). Identification of distinct vascular mural cell populations
+  during zebrafish embryonic development. Developmental Dynamics, 253(5). https://doi.org/10.1002/dvdy.681
+
+Dam, T. M. T., Kim, H. T., Moon, H. Y., Hwang, K. S., Jeong, Y. M., You, K. H., Lee, J. S., & Kim, C. H. (2011). Neuron-specific expression
+  of scratch genes during early zebrafish development. Molecules and Cells, 31(5). https://doi.org/10.1007/s10059-011-0052-4
+
+Dang, P., Fisher, S. A., Stefanik, D., Kim, J., & Raper, J. A. (2018). Coordination of olfactory receptor choice with guidance receptor
+  expression and function in olfactory sensory neurons. PLoS Genetics, 14(1). https://doi.org/10.1371/journal.pgen.1007164
+
+Davies, W. I. L., Tamai, T. K., Zheng, L., Fu, J. K., Rihel, J., Foster, R. G., Whitmore, D., & Hankins, M. W. (2015). An extended family of
+  novel vertebrate photopigments is widely expressed and displays a diversity of function. Genome Research, 25(11).
+  https://doi.org/10.1101/gr.189886.115
+
+De La Garza, G., Schleiffarth, J. R., Dunnwald, M., Mankad, A., Weirather, J. L., Bonde, G., Butcher, S., Mansour, T. A., Kousa, Y. A.,
+  Fukazawa, C. F., Houston, D. W., Manak, J. R., Schutte, B. C., Wagner, D. S., & Cornell, R. A. (2013). Interferon regulatory factor 6
+  promotes differentiation of the periderm by activating expression of grainyhead-like 3. Journal of Investigative Dermatology, 133(1). 
+  https://doi.org/10.1038/jid.2012.269
+
+Dee, C. T., Szymoniuk, C. R., Mills, P. E. D., & Takahashi, T. (2013). Defective neural crest migration revealed by a Zebrafish model of Alx1-related frontonasal dysplasia. Human Molecular Genetics, 22(2). https://doi.org/10.1093/hmg/dds423
+
+D’Gama, P. P., Qiu, T., Cosacak, M. I., Rayamajhi, D., Konac, A., Hansen, J. N., Ringers, C., Acuña-Hinrichsen, F., Hui, S. P., Olstad, E. 
+  W., Chong, Y. L., Lim, C. K. A., Gupta, A., Ng, C. P., Nilges, B. S., Kashikar, N. D., Wachten, D., Liebl, D., Kikuchi, K., …
+  Jurisch-Yaksi, N. (2021). Diversity and function of motile ciliated cell types within ependymal lineages of the zebrafish brain. Cell
+  Reports, 37(1). https://doi.org/10.1016/j.celrep.2021.109775
+
+Eberhart, J. K., Swartz, M. E., Crump, J. G., & Kimmel, C. B. (2006). Early Hedgehog signaling from neural to oral epithelium organizes
+  anterior craniofacial development. Development, 133(6). https://doi.org/10.1242/dev.02281
+
+Ebrahim, S., Avenarius, M. R., Grati, M., Krey, J. F., Windsor, A. M., Sousa, A. D., Ballesteros, A., Cui, R., Millis, B. A., Salles, F. T.,
+  Baird, M. A., Davidson, M. W., Jones, S. M., Choi, D., Dong, L., Raval, M. H., Yengo, C. M., Barr-Gillespie, P. G., & Kachar, B. (2016).
+  Stereocilia-staircase spacing is influenced by myosin III motors and their cargos espin-1 and espin-like. Nature Communications, 7.
+  https://doi.org/10.1038/ncomms10833
+
+Elazary, Y., Cheow, K., Cheng, R. K., Ghosh, R., Shainer, I., Wexler, Y., Crasta, K., Gothilf, Y., & Jesuthasan, S. J. (2023). Glial cells
+  expressing visual cycle genes are vital for photoreceptor survival in the zebrafish pineal gland. Journal of Pineal Research, 74(3).
+  https://doi.org/10.1111/jpi.12854
+
+Eshed, Y., Feinberg, K., Poliak, S., Sabanay, H., Sarig-Nadir, O., Spiegel, I., Bermingham, J. R., & Peles, E. (2005). Gliomedin mediates
+  Schwann cell-axon interaction and the molecular assembly of the nodes of Ranvier. Neuron, 47(2).
+  https://doi.org/10.1016/j.neuron.2005.06.026
+
+Esho, T., Kobbe, B., Tufa, S. F., Keene, D. R., Paulsson, M., & Wagener, R. (2023). The Fraser Complex Proteins (Frem1, Frem2, and Fras1)
+  Can Form Anchoring Cords in the Absence of AMACO at the Dermal–Epidermal Junction of Mouse Skin. International Journal of Molecular
+  Sciences, 24(7). https://doi.org/10.3390/ijms24076782
+
+Fang, Q., Indzhykulian, A. A., Mustapha, M., Riordan, G. P., Dolan, D. F., Friedman, T. B., Belyantseva, I. A., Frolenkov, G. I., Camper, S.
+  A., & Bird, J. E. (2015). The 133-kDa N-terminal domain enables myosin 15 to maintain mechanotransducing stereocilia and is essential for
+  hearing. ELife, 4(AUGUST2015). https://doi.org/10.7554/eLife.08627
+
+Ferrante, M. I., Kiff, R. M., Goulding, D. A., & Stemple, D. L. (2011). Troponin T is essential for sarcomere assembly in zebrafish skeletal
+  muscle. Journal of Cell Science, 124(4). https://doi.org/10.1242/jcs.071274
+
+Fischer, B., Metzger, M., Richardson, R., Knyphausen, P., Ramezani, T., Franzen, R., Schmelzer, E., Bloch, W., Carney, T. J., & 
+  Hammerschmidt, M. (2014). p53 and TAp63 Promote Keratinocyte Proliferation and Differentiation in Breeding Tubercles of the Zebrafish.
+  PLoS Genetics, 10(1). https://doi.org/10.1371/journal.pgen.1004048
+
+Gao, Y., Jin, Q., Gao, C., Chen, Y., Sun, Z., Guo, G., & Peng, J. (2022). Unraveling Differential Transcriptomes and Cell Types in Zebrafish
+  Larvae Intestine and Liver. Cells, 11(20). https://doi.org/10.3390/cells11203290
+
+Giovannone, D., Paul, S., Schindler, S., Arata, C., Farmer, D. T., Patel, P., Smeeton, J., & Gage Crump, J. (2019). Programmed conversion of
+  hypertrophic chondrocytes into osteoblasts and marrow adipocytes within zebrafish bones. ELife, 8. https://doi.org/10.7554/eLife.42736
+
+Gore, A. V., Pillay, L. M., Venero Galanternik, M., & Weinstein, B. M. (2018). The zebrafish: A fintastic model for hematopoietic
+  development and disease. Wiley Interdisciplinary Reviews: Developmental Biology, 7(3). https://doi.org/10.1002/wdev.312
+
+Grimm, L., Mason, E., Yu, H., Dudczig, S., Panara, V., Chen, T., Bower, N. I., Paterson, S., Rondon Galeano, M., Kobayashi, S., Senabouth,
+  A., Lagendijk, A. K., Powell, J., Smith, K. A., Okuda, K. S., Koltowska, K., & Hogan, B. M. (2023). Single‐cell analysis of lymphatic
+  endothelial cell fate specification and differentiation during zebrafish development. The EMBO Journal, 42(11).
+  https://doi.org/10.15252/embj.2022112590
+
+Ha, K., Buchan, J. G., Alvarado, D. M., Mccall, K., Vydyanath, A., Luther, P. K., Goldsmith, M. I., Dobbs, M. B., & Gurnett, C. A. (2013).
+  MYBPC1 mutations impair skeletal muscle function in zebrafish models of arthrogryposis. Human Molecular Genetics, 22(24).
+  https://doi.org/10.1093/hmg/ddt344
+
+Han, Y., Mu, Y., Li, X., Xu, P., Tong, J., Liu, Z., Ma, T., Zeng, G., Yang, S., Du, J., & Meng, A. (2011). Grhl2 deficiency impairs otic
+  development and hearing ability in a zebrafish model of the progressive dominant hearing loss DFNA28. Human Molecular Genetics, 20(16).
+  https://doi.org/10.1093/hmg/ddr234
+
+Hasan, S. S., Tsaryk, R., Lange, M., Wisniewski, L., Moore, J. C., Lawson, N. D., Wojciechowska, K., Schnittler, H., & Siekmann, A. F.
+  (2017). Endothelial Notch signalling limits angiogenesis via control of artery formation. Nature Cell Biology, 19(8).
+  https://doi.org/10.1038/ncb3574
+
+He, X., Ohba, S., Hojo, H., & McMahon, A. P. (2016). AP-1 family members act with Sox9 to promote chondrocyte hypertrophy. Development
+  (Cambridge), 143(16). https://doi.org/10.1242/dev.134502
+
+He, X., Xiong, D., Zhao, L., Fu, J., & Luo, L. (2024). Meningeal lymphatic supporting cells govern the formation and maintenance of
+  zebrafish mural lymphatic endothelial cells. Nature Communications, 15(1). https://doi.org/10.1038/s41467-024-49818-5
+
+Heermann, S., Schmücker, J., Hinz, U., Rickmann, M., Unterbarnscheidt, T., Schwab, M. H., & Krieglstein, K. (2011). Neuregulin 1 type
+  III/ErbB signaling is crucial for schwann cell colonization of sympathetic axons. PLoS ONE, 6(12).
+  https://doi.org/10.1371/journal.pone.0028692
+
+Henson, H. E., Parupalli, C., Ju, B., & Taylor, M. R. (2014). Functional and genetic analysis of choroid plexus development in zebrafish.
+  Frontiers in Neuroscience, 8(OCT). https://doi.org/10.3389/fnins.2014.00364
+
+Heppert, J. K., Lickwar, C. R., Tillman, M. C., Davis, B. R., Davison, J. M., Lu, H. Y., Chen, W., Busch-Nentwich, E. M., Corcoran, D. L., &
+  Rawls, J. F. (2022). Conserved roles for Hnf4 family transcription factors in zebrafish development and intestinal function. Genetics,
+  222(4). https://doi.org/10.1093/genetics/iyac133
+
+Herzog, W., Zeng, X., Lele, Z., Sonntag, C., Ting, J. W., Chang, C. Y., & Hammerschmidt, M. (2003). Adenohypophysis formation in the
+  zebrafish and its dependence on Sonic hedgehog. Developmental Biology, 254(1). https://doi.org/10.1016/S0012-1606(02)00124-0
+
+Hinits, Y., Pan, L., Walker, C., Dowd, J., Moens, C. B., & Hughes, S. M. (2012). Zebrafish Mef2ca and Mef2cb are essential for both first
+  and second heart field cardiomyocyte differentiation. Developmental Biology, 369(2). https://doi.org/10.1016/j.ydbio.2012.06.019
+
+Horstick, E. J., Linsley, J. W., Dowling, J. J., Hauser, M. A., McDonald, K. K., Ashley-Koch, A., Saint-Amant, L., Satish, A., Cui, W. W.,
+  Zhou, W., Sprague, S. M., Stamm, D. S., Powell, C. M., Speer, M. C., Franzini-Armstrong, C., Hirata, H., & Kuwada, J. Y. (2013). Stac3 is
+  a component of the excitation-contraction coupling machinery and mutated in Native American myopathy. Nature Communications, 4.
+  https://doi.org/10.1038/ncomms2952
+
+Hotz, J. M., Thomas, J. R., Katz, E. N., Robey, R. W., Horibata, S., & Gottesman, M. M. (2021). ATP-binding cassette transporters at the
+  zebrafish blood-brain barrier and the potential utility of the zebrafish as an in vivo model. In Cancer Drug Resistance (Vol. 4, Number
+  3). https://doi.org/10.20517/cdr.2021.35
+
+Jänicke, M., Renisch, B., & Hammerschmidt, M. (2010). Zebrafish grainyhead-like1 is a common marker of different non-keratinocyte epidermal
+  cell lineages, which segregate from each other in a Foxi3-dependent manner. International Journal of Developmental Biology, 54(5).
+  https://doi.org/10.1387/ijdb.092877mj
+
+Jeong, I., Andreassen, S. N., Hoang, L., Poulain, M., Seo, Y., Park, H. C., Fürthauer, M., MacAulay, N., & Jurisch-Yaksi, N. (2024). The
+  evolutionarily conserved choroid plexus contributes to the homeostasis of brain ventricles in zebrafish. Cell Reports, 43(6).
+  https://doi.org/10.1016/j.celrep.2024.114331
+
+Jha, S. K., Rauniyar, K., Karpanen, T., Leppänen, V. M., Brouillard, P., Vikkula, M., Alitalo, K., & Jeltsch, M. (2017). Efficient
+  activation of the lymphangiogenic growth factor VEGF-C requires the C-terminal domain of VEGF-C and the N-terminal domain of CCBE1.
+  Scientific Reports, 7(1). https://doi.org/10.1038/s41598-017-04982-1
+
+Kim, K., Lee, H., Ahn, S., Kim, Y. H., & Oh, C. K. (2025). Unveiling the role of RPS17 and SLC4A1 in diamond-Blackfan Anemia: A
+  zebrafish-based study. Blood Cells, Molecules, and Diseases, 112. https://doi.org/10.1016/j.bcmd.2025.102912
+
+Kim, S. H., Choi, H. Y., So, J. H., Kim, C. H., Ho, S. Y., Frank, M., Li, Q., & Uitto, J. (2010). Zebrafish type XVII collagen: Gene
+  structures, expression profiles, and morpholino “knock-down” phenotypes. Matrix Biology, 29(7).
+  https://doi.org/10.1016/j.matbio.2010.07.002
+
+Konrad, M., Schaller, A., Seelow, D., Pandey, A. V., Waldegger, S., Lesslauer, A., Vitzthum, H., Suzuki, Y., Luk, J. M., Becker, C.,
+  Schlingmann, K. P., Schmid, M., Rodriguez-Soriano, J., Ariceta, G., Cano, F., Enriquez, R., Jüppner, H., Bakkaloglu, S. A., Hediger, M.
+  A., Weber, S. (2006). Mutations in the tight-junction gene claudin 19 (CLDN19) are associated with renal magnesium wasting, renal failure,
+  and severe ocular involvement. American Journal of Human Genetics, 79(5). https://doi.org/10.1086/508617
+
+Lagman, D., Callado-Pérez, A., Franzén, I. E., Larhammar, D., & Abalo, X. M. (2015). Transducin duplicates in the zebrafish retina and
+  pineal complex: Differential specialisation after the teleost tetraploidisation. PLoS ONE, 10(3).
+  https://doi.org/10.1371/journal.pone.0121330
+
+Lawrence, E. A., Kague, E., Aggleton, J. A., Harniman, R. L., Roddy, K. A., & Hammond, C. L. (2018). The mechanical impact of col11a2 loss
+  on joints; col11a2 mutant zebrafish show changes to joint development and function, which leads to early-onset osteoarthritis.
+  Philosophical Transactions of the Royal Society B: Biological Sciences, 373(1759). https://doi.org/10.1098/rstb.2017.0335
+
+Le Guen, L., Karpanen, T., Schulte, D., Harris, N. C., Koltowska, K., Roukens, G., Bower, N. I., van Impel, A., Stacker, S. A., Achen, M.
+  G., Schulte-Merker, S., & Hogan, B. M. (2014). Ccbe1 regulates Vegfc-mediated induction of Vegfr3 signaling during embryonic
+  lymphangiogenesis. Development (Cambridge), 141(6). https://doi.org/10.1242/dev.100495
+
+Lee, R. T. H., Asharani, P. V., & Carney, T. J. (2014). Basal keratinocytes contribute to all strata of the adult zebrafish epidermis. PLoS
+  ONE, 9(1). https://doi.org/10.1371/journal.pone.0084858
+
+Lendahl, U., Muhl, L., & Betsholtz, C. (2022). Identification, discrimination and heterogeneity of fibroblasts. In Nature Communications
+  (Vol. 13, Number 1). https://doi.org/10.1038/s41467-022-30633-9
+
+Leonard, E. V., Figueroa, R. J., Bussmann, J., Lawson, N. D., Amigo, J. D., & Siekmann, A. F. (2022). Regenerating vascular mural cells in
+  zebrafish fin blood vessels are not derived from pre-existing mural cells and differentially require Pdgfrb signalling for their
+  development. Development (Cambridge), 149(7). https://doi.org/10.1242/dev.199640
+
+Li, Q., Frank, M., Thisse, C. I., Thisse, B. V., & Uitto, J. (2011). Zebrafish: A model system to study heritable skin diseases. Journal of
+  Investigative Dermatology, 131(3). https://doi.org/10.1038/jid.2010.388
+
+Li, W. H., Zhou, L., Li, Z., Wang, Y., Shi, J. T., Yang, Y. J., & Gui, J. F. (2015). Zebrafish lbh-like is required for Otx2-mediated
+  photoreceptor differentiation. International Journal of Biological Sciences, 11(6). https://doi.org/10.7150/ijbs.11244
+
+Li, Y., Wang, C., Zhang, L., Chen, B., Mo, Y., & Zhang, J. (2022). Claudin-5a is essential for the functional formation of both zebrafish
+  blood-brain barrier and blood-cerebrospinal fluid barrier. Fluids and Barriers of the CNS, 19(1).
+  https://doi.org/10.1186/s12987-022-00337-9
+
+Lin, C. Y., Yung, R. F., Lee, H. C., Chen, W. T., Chen, Y. H., & Tsai, H. J. (2006). Myogenic regulatory factors Myf5 and Myod function
+  distinctly during craniofacial myogenesis of zebrafish. Developmental Biology, 299(2). https://doi.org/10.1016/j.ydbio.2006.08.042
+
+Liu, H., Leslie, E. J., Jia, Z., Smith, T., Eshete, M., Butali, A., Dunnwald, M., Murray, J., & Cornell, R. A. (2016). Irf6 directly
+  regulates Klf17 in zebrafish periderm and Klf4 in murine oral epithelium, and dominant-negative KLF4 variants are present in patients with
+  cleft lip and palate. Human Molecular Genetics, 25(4). https://doi.org/10.1093/hmg/ddv614
+
+Liu, N. A., Huang, H., Yang, Z., Herzog, W., Hammerschmidt, M., Lin, S., & Melmed, S. (2003). Pituitary corticotroph ontogeny and regulation
+  in transgenic zebrafish. Molecular Endocrinology, 17(5). https://doi.org/10.1210/me.2002-0392
+
+Liu, Y., & Semina, E. V. (2012). PITX2 deficiency results in abnormal ocular and craniofacial development in zebrafish. PLoS ONE, 7(1).
+  https://doi.org/10.1371/journal.pone.0030896
+
+Liu, Z., Meng, Y., Ishikura, A., & Kawakami, A. (2024). Live tracking of basal stem cells of the epidermis during growth, homeostasis and
+  injury response in zebrafish. Development (Cambridge), 151(2). https://doi.org/10.1242/dev.202315
+
+Lyons, D. A., Pogoda, H. M., Voas, M. G., Woods, I. G., Diamond, B., Nix, R., Arana, N., Jacobs, J., & Talbot, W. S. (2005). erbb3 and erbb2
+  are essential for Schwann cell migration and myelination in zebrafish. Current Biology, 15(6). https://doi.org/10.1016/j.cub.2005.02.030
+
+Manchanda, A., Chatterjee, P., Bonventre, J. A., Haggard, D. E., Kindt, K. S., Tanguay, R. L., & Johnson, C. P. (2019). Otoferlin Depletion
+  Results in Abnormal Synaptic Ribbons and Altered Intracellular Calcium Levels in Zebrafish. Scientific Reports, 9(1).
+  https://doi.org/10.1038/s41598-019-50710-2
+
+Mano, H., Asaoka, Y., Kojima, D., & Fukada, Y. (2019). Brain-specific homeobox Bsx specifies identity of pineal gland between serially
+  homologous photoreceptive organs in zebrafish. Communications Biology, 2(1). https://doi.org/10.1038/s42003-019-0613-1
+
+Mathiyalagan, N., Johnson, T. K., Di Pastena, Z., Fuller, J. N., Miles, L. B., & Dworkin, S. (2025). Loss of the epithelial transcription
+  factor grhl3 leads to variably penetrant developmental phenotypes in zebrafish. Developmental Dynamics, 254(10).
+  https://doi.org/10.1002/dvdy.70003
+
+McGraw, H. F., Snelson, C. D., Prendergast, A., Suli, A., & Raible, D. W. (2012). Postembryonic neuronal addition in Zebrafish dorsal root ganglia is regulated by Notch signaling. Neural Development, 7(1). https://doi.org/10.1186/1749-8104-7-23
+
+Mo, D., Lv, M., & Mao, X. (2024). Using different zebrafish models to explore liver regeneration. In Frontiers in Cell and Developmental
+  Biology (Vol. 12). https://doi.org/10.3389/fcell.2024.1485773
+
+Molder, L. Te, Pereda, J. M. D., & Sonnenberg, A. (2021). Regulation of hemidesmosome dynamics and cell signaling by integrin α6β4. In
+  Journal of Cell Science (Vol. 134, Number 18). https://doi.org/10.1242/jcs.259004
+
+Moll, T. O. C., & Farber, S. A. (2024). Zebrafish ApoB-Containing Lipoprotein Metabolism: A Closer Look. In Arteriosclerosis, Thrombosis,
+  and Vascular Biology (Vol. 44, Number 5). https://doi.org/10.1161/ATVBAHA.123.318287
+
+Müller, J. S., Jepson, C. D., Laval, S. H., Bushby, K., Straub, V., & Lochmüller, H. (2010). Dok-7 promotes slow muscle integrity as well as
+  neuromuscular junction formation in a zebrafish model of congenital myasthenic syndromes. Human Molecular Genetics, 19(9).
+  https://doi.org/10.1093/hmg/ddq049
+
+Murayama, E., Herbomel, P., Kawakami, A., Takeda, H., & Nagasawa, H. (2005). Otolith matrix proteins OMP-1 and Otolin-1 are necessary for
+  normal otolith growth and their correct anchoring onto the sensory maculae. Mechanisms of Development, 122(6).
+  https://doi.org/10.1016/j.mod.2005.03.002
+
+Nechiporuk, A., Linbo, T., Poss, K. D., & Raible, D. W. (2007). Specification of epibranchial placodes in zebrafish. Development, 134(3).
+  https://doi.org/10.1242/dev.02749
+
+Nica, G., Herzog, W., Sonntag, C., & Hammerschmidt, M. (2004). Zebrafish pit1 mutants lack three pituitary cell types and develop severe
+  dwarfism. Molecular Endocrinology, 18(5). https://doi.org/10.1210/me.2003-0377
+
+Nicolson, T. (2015). Ribbon synapses in zebrafish hair cells. In Hearing Research (Vol. 330). https://doi.org/10.1016/j.heares.2015.04.003
+  Oehlers, S. H. B., Flores, M. V., Hall, C. J., O’Toole, R., Swift, S., Crosier, K. E., & Crosier, P. S. (2010). Expression of zebrafish
+  cxcl8 (interleukin-8) and its receptors during development and in response to immune stimulation. Developmental and Comparative
+  Immunology, 34(3). https://doi.org/10.1016/j.dci.2009.11.007
+
+Olson, B. D., Sgourdou, P., & Downes, G. B. (2010). Analysis of a zebrafish behavioral mutant reveals a dominant mutation in atp2a1/SERCA1.
+  Genesis, 48(6). https://doi.org/10.1002/dvg.20631
+
+Olstad, E. W., Ringers, C., Hansen, J. N., Wens, A., Brandt, C., Wachten, D., Yaksi, E., & Jurisch-Yaksi, N. (2019). Ciliary Beating
+  Compartmentalizes Cerebrospinal Fluid Flow in the Brain and Regulates Ventricular Development. Current Biology, 29(2).
+  https://doi.org/10.1016/j.cub.2018.11.059
+
+Ono, F., Shcherbatko, A., Higashijima, S. ichi, Mandel, G., & Brehm, P. (2002). The zebrafish motility mutant twitch once reveals new roles
+  for rapsyn in synaptic function. Journal of Neuroscience, 22(15). https://doi.org/10.1523/jneurosci.22-15-06491.2002
+
+Paffett-Lugassy, N., Novikov, N., Jeffrey, S., Abrial, M., Guner-Ataman, B., Sakthivel, S., Burns, C. E., & Burns, C. G. (2017). Unique
+  developmental trajectories and genetic regulation of ventricular and outflow tract progenitors in the zebrafish second heart field.
+  Development (Cambridge), 144(24). https://doi.org/10.1242/dev.153411
+
+Pan, Y. A., Choy, M., Prober, D. A., & Schier, A. F. (2012). Robo2 determines subtype-specific axonal projections of trigeminal sensory
+  neurons. Development, 139(3). https://doi.org/10.1242/dev.076588
+
+Parab, S., Quick, R. E., & Matsuoka, R. L. (2021). Endothelial cell-type-specific molecular requirements for angiogenesis drive fenestrated
+  vessel development in the brain. ELife, 10. https://doi.org/10.7554/eLife.64295
+
+Phatak, M., Kulkarni, S., Miles, L. B., Anjum, N., Dworkin, S., & Sonawane, M. (2021). Grhl3 promotes retention of epidermal cells under
+  endocytic stress to maintain epidermal architecture in zebrafish. PLoS Genetics, 17(9). https://doi.org/10.1371/journal.pgen.1009823
+
+Progatzky, F., Terence Cook, H., Lamb, J. R., Bugeon, L., & Dallman, M. J. (2016). Mucosal inflammation at the respiratory interface: A
+  zebrafish model. American Journal of Physiology - Lung Cellular and Molecular Physiology, 310(6).
+  https://doi.org/10.1152/ajplung.00323.2015
+
+Psutkova, V., Nickl, P., Brezinova, V., Machonova, O., & Machon, O. (2025). Transcription factor Meis1b regulates craniofacial morphogenesis
+  in zebrafish. Developmental Dynamics, 254(1). https://doi.org/10.1002/dvdy.731
+
+Qian, F., Wei, G., Gao, Y., Wang, X., Gong, J., Guo, C., Wang, X., Zhang, X., Zhao, J., Wang, C., Xu, M., Hu, Y., Yin, G., Kang, J., Chai,
+  R., Xie, G., & Liu, D. (2022). Single-cell RNA-sequencing of zebrafish hair cells reveals novel genes potentially involved in hearing
+  loss. Cellular and Molecular Life Sciences, 79(7). https://doi.org/10.1007/s00018-022-04410-2
+
+Quiñonez-Silvero, C., Hübner, K., & Herzog, W. (2020). Development of the brain vasculature and the blood-brain barrier in zebrafish. In
+  Developmental Biology (Vol. 457, Number 2). https://doi.org/10.1016/j.ydbio.2019.03.005
+
+Rajan, A. M., Ma, R. C., Kocha, K. M., Zhang, D. J., & Huang, P. (2020). Dual function of perivascular fibroblasts in vascular stabilization
+  in zebrafish. PLoS Genetics, 16(10). https://doi.org/10.1371/journal.pgen.1008800
+
+Raphael, A. R., Perlin, J. R., & Talbot, W. S. (2010). Schwann cells reposition a peripheral nerve to isolate it from postembryonic
+  remodeling of its targets. Development, 137(21). https://doi.org/10.1242/dev.057521
+
+Raphael, A. R., & Talbot, W. S. (2011). New Insights into Signaling During Myelination in Zebrafish. In Current Topics in Developmental
+  Biology (Vol. 97). https://doi.org/10.1016/B978-0-12-385975-4.00007-3
+
+Ryu, J. R., Ahuja, S., Arnold, C. R., Potts, K. G., Mishra, A., Yang, Q., Sargurupremraj, M., Mahoney, D. J., Seshadri, S., Debette, S., &
+  Childs, S. J. (2022). Stroke-associated intergenic variants modulate a human FOXF2 transcriptional enhancer. Proceedings of the National
+  Academy of Sciences of the United States of America, 119(35). https://doi.org/10.1073/pnas.2121333119
+
+Sacilotto, N., Monteiro, R., Fritzsche, M., Becker, P. W., Sanchez-del-Campo, L., Liu, K., Pinheiro, P., Ratnayaka, I., Davies, B., Goding,
+  C. R., Patient, R., Bou-Gharios, G., & De Val, S. (2013). Analysis of Dll4 regulation reveals a combinatorial role for Sox and Notch in
+  arterial development. Proceedings of the National Academy of Sciences of the United States of America, 110(29).
+  https://doi.org/10.1073/pnas.1300805110
+
+Sapède, D., Chaigne, C., Blader, P., & Cau, E. (2020). Functional heterogeneity in the pineal projection neurons of zebrafish. Molecular and
+  Cellular Neuroscience, 103. https://doi.org/10.1016/j.mcn.2020.103468
+
+Sarmah, S., Hawkins, M. R., Manikandan, P., Farrell, M., & Marrs, J. A. (2022). Elf3 deficiency during zebrafish development alters
+  extracellular matrix organization and disrupts tissue morphogenesis. PLoS ONE, 17(11 November).
+  https://doi.org/10.1371/journal.pone.0276255
+
+Sato, Y., Miyasaka, N., & Yoshihara, Y. (2005). Mutually exclusive glomerular innervation by two distinct types of olfactory sensory neurons
+  revealed in transgenic zebrafish. Journal of Neuroscience, 25(20). https://doi.org/10.1523/JNEUROSCI.0679-05.2005
+
+Seritrakul, P., & Gross, J. M. (2019). Genetic and epigenetic control of retinal development in zebrafish. In Current Opinion in
+  Neurobiology (Vol. 59). https://doi.org/10.1016/j.conb.2019.05.008
+
+Shao, X., Lakhina, V., Dang, P., Cheng, R. P., Marcaccio, C. L., & Raper, J. A. (2017). Olfactory sensory axons target specific
+  protoglomeruli in the olfactory bulb of zebrafish. Neural Development, 12(1). https://doi.org/10.1186/s13064-017-0095-0
+
+Shi, T., Beaulieu, M. O., Saunders, L. M., Fabian, P., Trapnell, C., Segil, N., Crump, J. G., & Raible, D. W. (2023). Single-cell
+  transcriptomic profiling of the zebrafish inner ear reveals molecularly distinct hair cell and supporting cell subtypes. ELife, 12.
+  https://doi.org/10.7554/eLife.82978
+
+Shih, Y. H., Portman, D., Idrizi, F., Grosse, A., & Lawson, N. D. (2021). Integrated molecular analysis identifies a conserved pericyte gene
+  signature in zebrafish. Development (Cambridge), 148(23). https://doi.org/10.1242/dev.200189
+
+Slanchev, K., Carney, T. J., Stemmler, M. P., Koschorz, B., Amsterdam, A., Schwarz, H., & Hammerschmidt, M. (2009). The epithelial cell
+  adhesion molecule EpCAM is required for epithelial morphogenesis and integrity during zebrafish epiboly and skin development. PLoS
+  Genetics, 5(7). https://doi.org/10.1371/journal.pgen.1000563
+
+Smeeton, J., Natarajan, N., Anderson, T., Tseng, K. C., Fabian, P., & Crump, J. G. (2022). Regeneration of Jaw Joint Cartilage in Adult
+  Zebrafish. Frontiers in Cell and Developmental Biology, 9. https://doi.org/10.3389/fcell.2021.777787
+
+Smith, E. T., Pacentine, I., Shipman, A., Hill, M., & Nicolson, T. (2020). Disruption of tmc1/2a/2b genes in zebrafish reveals subunit
+  requirements in subtypes of inner ear hair cells. Journal of Neuroscience, 40(23). https://doi.org/10.1523/JNEUROSCI.0163-20.2020
+
+Smith, E. T., Sun, P., Yu, S. K., Raible, D. W., & Nicolson, T. (2023). Differential expression of mechanotransduction complex genes in
+  auditory/vestibular hair cells in zebrafish. Frontiers in Molecular Neuroscience, 16. https://doi.org/10.3389/fnmol.2023.1274822
+
+
+Söllner, C., Burghammer, M., Busch-Nentwich, E., Berger, J., Schwarz, H., Riekel, C., & Nicolson, T. (2003). Control of crystal size and
+  lattice formation by starmaker in otolith biomineratization. Science, 302(5643). https://doi.org/10.1126/science.1088443
+
+Söllner, C., Schwarz, H., Geisler, R., & Nicolson, T. (2004). Mutated otopetrin 1 affects the genesis of otoliths and the localization of
+  Starmaker in zebrafish. Development Genes and Evolution, 214(12). https://doi.org/10.1007/s00427-004-0440-2
+
+Sommer, F., Torraca, V., & Meijer, A. H. (2020). Chemokine Receptors and Phagocyte Biology in Zebrafish. In Frontiers in Immunology (Vol.
+  11). https://doi.org/10.3389/fimmu.2020.00325
+
+Stooke-Vaughan, G. A., Obholzer, N. D., Baxendale, S., Megason, S. G., & Whitfield, T. T. (2015). Otolith tethering in the zebrafish otic
+  vesicle requires otogelin and α-Tectorin. Development (Cambridge), 142(6). https://doi.org/10.1242/dev.116632
+
+Suzuki, H., Ogawa, T., Fujita, S., Sone, R., & Kawahara, A. (2023). Cooperative contributions of the klf1 and klf17 genes in zebrafish
+  primitive erythropoiesis. Scientific Reports, 13(1). https://doi.org/10.1038/s41598-023-39196-1
+
+Sztal, T. E., Zhao, M., Williams, C., Oorschot, V., Parslow, A. C., Giousoh, A., Yuen, M., Hall, T. E., Costin, A., Ramm, G., Bird, P. I.,
+  Busch-Nentwich, E. M., Stemple, D. L., Currie, P. D., Cooper, S. T., Laing, N. G., Nowak, K. J., & Bryson-Richardson, R. J. (2015). 
+  Zebrafish models for nemaline myopathy reveal a spectrum of nemaline bodies contributing to reduced muscle function. Acta
+  Neuropathologica, 130(3). https://doi.org/10.1007/s00401-015-1430-3
+
+Takahashi, T., Yamaguchi, S., Chida, K., & Shibuya, M. (2001). A single autophosphorylation site on KDR/Flk-1 is essential for
+  VEGF-A-dependent activation of PLC-γ and DNA synthesis in vascular endothelial cells. EMBO Journal, 20(11).
+  https://doi.org/10.1093/emboj/20.11.2768
+
+Uphoff, K., van Impel, A., Muhl, L., Stehling, M., Betsholtz, C., & Schulte-Merker, S. (2026). Loss of meningeal lymphatic endothelial cells
+  results in formation of a newly forming vascular network with scavenging function. Development, 153(4). https://doi.org/10.1242/dev.204988
+
+Vitorino, M., Jusuf, P. R., Maurus, D., Kimura, Y., Higashijima, S. I., & Harris, W. A. (2009). Vsx2 in the zebrafish retina: Restricted
+  lineages through derepression. Neural Development, 4(1). https://doi.org/10.1186/1749-8104-4-14
+
+Wang, D., Qin, J., Jia, J., Yan, P., & Li, W. (2017). Pou1f1, the key transcription factor related to somatic growth in tilapia (Orechromis
+  niloticus), is regulated by two independent post-transcriptional regulation mechanisms. Biochemical and Biophysical Research
+  Communications, 483(1). https://doi.org/10.1016/j.bbrc.2016.12.106
+
+Wang, Q., Xu, L., Miura, J., Saha, M. K., Uemura, Y., Sandell, L. L., Trainor, P. A., Yamashiro, T., & Kurosaka, H. (2021). Branchiomeric
+  Muscle Development Requires Proper Retinoic Acid Signaling. Frontiers in Cell and Developmental Biology, 9.
+  https://doi.org/10.3389/fcell.2021.596838
+
+Whitesell, T. R., Chrystal, P. W., Ryu, J. R., Munsie, N., Grosse, A., French, C. R., Workentine, M. L., Li, R., Zhu, L. J., Waskiewicz, A.,
+  Lehmann, O. J., Lawson, N. D., & Childs, S. J. (2019). foxc1 is required for embryonic head vascular smooth muscle differentiation in
+  zebrafish. Developmental Biology, 453(1). https://doi.org/10.1016/j.ydbio.2019.06.005
+
+Xie, Y., Meijer, A. H., & Schaaf, M. J. M. (2021). Modeling Inflammation in Zebrafish for the Development of Anti-inflammatory Drugs. In
+  Frontiers in Cell and Developmental Biology (Vol. 8). https://doi.org/10.3389/fcell.2020.620984
+
+Xu, K., Chong, D. C., Rankin, S. A., Zorn, A. M., & Cleaver, O. (2009). Rasip1 is required for endothelial cell motility, angiogenesis and
+  vessel formation. Developmental Biology, 329(2). https://doi.org/10.1016/j.ydbio.2009.02.033
+
+Yan, C. Y., Wu, F. Y., Sun, F., Fang, Y., Zhang, R. J., Zhang, C. R., Zhang, C. X., Wang, Z., Yang, R. M., Yang, L., Dong, M., Zhang, Q. Y.,
+  Ye, X. P., Song, H. D., & Zhao, S. X. (2023). The isl2a transcription factor regulates pituitary development in zebrafish. Frontiers in
+  Endocrinology, 14. https://doi.org/10.3389/fendo.2023.920548
+
+Yan, Y. L., Miller, C. T., Nissen, R., Singer, A., Liu, D., Kirn, A., Draper, B., Willoughby, J., Morcos, P. A., Amsterdam, A., Chung, B.
+  C., Westerfield, M., Haffter, P., Hopkins, N., Kimmel, C., & Postlethwait, J. H. (2002). A zebrafish sox9 gene required for cartilage
+  morphogenesis. Development, 129(21). https://doi.org/10.1242/dev.129.21.5065
+
+Yokoi, H., Yan, Y. L., Miller, M. R., BreMiller, R. A., Catchen, J. M., Johnson, E. A., & Postlethwait, J. H. (2009). Expression profiling
+  of zebrafish sox9 mutants reveals that Sox9 is required for retinal differentiation. Developmental Biology, 329(1).
+  https://doi.org/10.1016/j.ydbio.2009.01.002
+
+Zhang, Y., Chen, M., & Chen, C. (2021). Using the zebrafish as a genetic model to study erythropoiesis. In International Journal of
+  Molecular Sciences (Vol. 22, Number 19). https://doi.org/10.3390/ijms221910475
+
+Zheng, P. P., Romme, E., Van Der Spek, P. J., Dirven, C. M. F., Willemsen, R., & Kros, J. M. (2010). Glut1/SLC2A1 is crucial for the
+  development of the blood-brain barrier in vivo. Annals of Neurology, 68(6). https://doi.org/10.1002/ana.22318
+
+Zi, H., Peng, X., Sun, L., Li, H., Shen, X., Chen, M., Deng, Q., Hua, Y., Du, J., & Li, J. (2024). Foxc1b regulates brain pericyte
+  proliferation in zebrafish larvae. In Journal of Genetics and Genomics (Vol. 51, Number 11). https://doi.org/10.1016/j.jgg.2024.09.002
+ 

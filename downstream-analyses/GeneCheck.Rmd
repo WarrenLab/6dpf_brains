@@ -1,0 +1,543 @@
+---
+title: "Gene Check"
+output: 
+  html_notebook: 
+    toc: true
+    theme: cerulean
+    number_sections: true
+---
+This notebook checks for the expression of a target gene or target gene set within defined Astyanax mexicanus cell types.
+
+# . Environment
+## Load libraries
+```{r}
+# Seurat
+library(Seurat)
+
+# DEG analysis
+library(DESeq2)
+
+#plotting
+library(ggplot2)
+library(ggrepel) # label volcano
+
+#data management
+library(dplyr)
+```
+
+## Define functions
+surface vs cave 
+```{r}
+deseq2_pb_celltype <- function(cts, coldata, celltype,
+                               fdr_explore = 0.20,
+                               min_total_count = 10,
+                               min_samples = 2,
+                               shrink_type = c("apeglm", "ashr", "normal")) {
+
+  suppressPackageStartupMessages({
+    library(Matrix)
+    library(DESeq2)
+    library(dplyr)
+    library(tibble)
+  })
+
+  shrink_type <- match.arg(shrink_type)
+
+  stopifnot(is.matrix(cts) || inherits(cts, "dgCMatrix"))
+  stopifnot(all(c("col_id","sample","Population","CellType") %in% colnames(coldata)))
+
+  # Coerce to plain data.frame to avoid Rle/list columns breaking dplyr verbs
+  coldata <- as.data.frame(coldata, stringsAsFactors = FALSE)
+
+  coldata$col_id     <- as.character(coldata$col_id)
+  coldata$sample     <- as.character(coldata$sample)
+  coldata$Population <- as.character(coldata$Population)
+  coldata$CellType   <- as.character(coldata$CellType)
+
+  # Align count columns
+  stopifnot(all(coldata$col_id %in% colnames(cts)))
+  cts <- cts[, coldata$col_id, drop = FALSE]
+
+  # Subset to the requested cell type (already pseudobulked columns)
+  cd_ct <- coldata[coldata$CellType == celltype, , drop = FALSE]
+  if (nrow(cd_ct) == 0) stop("No pseudobulk samples for celltype: ", celltype)
+
+  cts_ct <- cts[, cd_ct$col_id, drop = FALSE]
+
+  # Prefilter genes
+  keep <- Matrix::rowSums(cts_ct >= min_total_count) >= min_samples
+  cts_ct <- cts_ct[keep, , drop = FALSE]
+  if (nrow(cts_ct) == 0) stop("All genes filtered out; relax thresholds.")
+
+  # Build DESeq2 colData and reorder to match columns
+  cd_ct2 <- unique(cd_ct[, c("col_id", "sample", "Population")])
+  cd_ct2 <- cd_ct2[match(colnames(cts_ct), cd_ct2$col_id), , drop = FALSE]
+  stopifnot(identical(colnames(cts_ct), cd_ct2$col_id))
+  rownames(cd_ct2) <- cd_ct2$col_id
+
+  # DESeq2
+  dds <- DESeqDataSetFromMatrix(
+    countData = round(cts_ct),
+    colData   = cd_ct2,
+    design    = ~ Population
+  )
+
+  dds$Population <- factor(dds$Population)
+  if (!("surface" %in% levels(dds$Population))) {
+    stop("Population must include 'surface'. Found: ", paste(levels(dds$Population), collapse = ", "))
+  }
+  if (length(levels(dds$Population)) != 2) {
+    stop("This function assumes exactly 2 Population levels. Found: ", paste(levels(dds$Population), collapse = ", "))
+  }
+
+  dds$Population <- relevel(dds$Population, ref = "surface")
+  dds <- DESeq(dds)
+
+  alt <- setdiff(levels(dds$Population), "surface")[1]
+  coef_name <- paste0("Population_", make.names(alt), "_vs_surface")
+  if (!coef_name %in% resultsNames(dds)) {
+    coef_name <- resultsNames(dds)[grepl("^Population_", resultsNames(dds))][1]
+  }
+
+  res <- results(dds, name = coef_name, alpha = fdr_explore) |>
+    as.data.frame() |>
+    tibble::rownames_to_column("gene")
+
+  res_shr <- tryCatch({
+    shr <- lfcShrink(dds, coef = coef_name, type = shrink_type)
+    as.data.frame(shr) |> tibble::rownames_to_column("gene")
+  }, error = function(e) {
+    shr <- lfcShrink(dds, coef = coef_name, type = "normal")
+    as.data.frame(shr) |> tibble::rownames_to_column("gene")
+  })
+
+  res_merged <- res |>
+    dplyr::left_join(
+      res_shr |> dplyr::select(gene, log2FoldChange) |> dplyr::rename(log2FoldChange_shrunk = log2FoldChange),
+      by = "gene"
+    ) |>
+    dplyr::arrange(padj, dplyr::desc(abs(log2FoldChange_shrunk)))
+
+  res_celltype <- res_merged |>
+    dplyr::filter(!is.na(padj), padj < fdr_explore)
+
+  list(
+    dds          = dds,
+    res_celltype = res_celltype,
+    res_all      = res_merged,
+    celltype     = celltype,
+    coef_name    = coef_name,
+    fdr_explore  = fdr_explore
+  )
+}
+```
+
+```{r}
+run_target_pb_by_celltype <- function(
+  cts,
+  coldata,
+  celltypes,
+  target_genes,
+  padj_cut = 0.05,
+  fdr_explore = 0.20,
+  min_total_count = 10,
+  min_samples = 2,
+  shrink_type = "apeglm"
+) {
+  suppressPackageStartupMessages({
+    library(dplyr)
+    library(purrr)
+    library(tibble)
+  })
+
+  map_dfr(celltypes, function(ct) {
+
+    message("Running: ", ct)
+
+    out <- deseq2_pb_celltype(
+      cts = cts,
+      coldata = coldata,
+      celltype = ct,
+      fdr_explore = fdr_explore,
+      min_total_count = min_total_count,
+      min_samples = min_samples,
+      shrink_type = shrink_type
+    )
+
+    res <- out$res_all
+
+    if (!"log2FoldChange_shrunk" %in% colnames(res)) {
+      res$log2FoldChange_shrunk <- res$log2FoldChange
+    }
+
+    res %>%
+      filter(gene %in% target_genes) %>%
+      mutate(
+        celltype = ct,
+        direction = case_when(
+          is.na(padj) ~ "Not tested / NA",
+          padj > padj_cut ~ "Not significant",
+          log2FoldChange_shrunk > 0 ~ "Up in Cave",
+          log2FoldChange_shrunk < 0 ~ "Up in Surface",
+          TRUE ~ "No change"
+        ),
+        significant = !is.na(padj) & padj <= padj_cut,
+        neglog10_padj = -log10(padj)
+      ) %>%
+      select(
+        celltype, gene, direction, significant,
+        padj, log2FoldChange, log2FoldChange_shrunk,
+        baseMean, neglog10_padj,
+        everything()
+      )
+  })
+}
+```
+
+volcano
+```{r}
+make_target_volcano <- function(res, target_genes, title = "") {
+  library(dplyr)
+  library(ggplot2)
+  library(ggrepel)
+
+  if (!"log2FoldChange_shrunk" %in% colnames(res)) {
+    res$log2FoldChange_shrunk <- res$log2FoldChange
+  }
+
+  de.volc <- res %>%
+    mutate(
+      logP = -log10(padj),
+      sig = case_when(
+        padj <= 0.05 & log2FoldChange_shrunk > 0 ~ "Up in Cave",
+        padj <= 0.05 & log2FoldChange_shrunk < 0 ~ "Up in Surface",
+        TRUE ~ "Not sig"
+      ),
+      label = ifelse(gene %in% target_genes, gene, NA)
+    )
+
+  ggplot(de.volc, aes(x = log2FoldChange_shrunk, y = logP, color = sig)) +
+    geom_point(alpha = 0.6, size = 1.2) +
+    geom_text_repel(
+      aes(label = label),
+      color = "black",
+      size = 3,
+      na.rm = TRUE,
+      min.segment.length = 0
+    ) +
+    scale_color_manual(values = c(
+      "Up in Cave" = "palevioletred",
+      "Up in Surface" = "darkseagreen3",
+      "Not sig" = "lightgray"
+    )) +
+    geom_hline(yintercept = -log10(0.05), linetype = "dashed", color = "gray50") +
+    theme_minimal() +
+    labs(
+      title = title,
+      x = "log2FC Cave vs Surface",
+      y = "-log10 adjusted p-value"
+    )
+}
+```
+
+# . Data
+## load
+```{r}
+#whole brain
+lSeq <-readRDS("lSeq.rds")
+
+#neurons
+lSeqNeuroLB <-readRDS("lSeqNeuroLB.rds")
+
+#glia
+lSeqGliaGen <-readRDS("lSeqGliaGen.rds")
+
+#other
+lSeqNonLB <-readRDS("lSeqNonLB.rds")
+```
+
+# . Target Genes 
+## Check for genes in data set
+example genes of interest based on zebrafish names
+```{r}
+DotPlot(lSeq, features = c(
+  
+  #mch
+  "pmch", "pmchl", "pmch1", "pmch2",
+ 
+  
+  #mchr
+  "mchr1a", "mchr1b", "mchr2", "mchr2a",
+  
+  #Adenosine recepotors
+  "adora1a", "adora1b",
+  "adora2aa", "adora2ab", "adodra2a.1",
+  "adora2b", "adora3", "adora3a", "adora3a.1"
+  
+)) + RotatedAxis()
+```
+actually annotated genes
+```{r}
+DotPlot(lSeq, features = c(
+  
+  #mch
+  "pmch", "pmchl",
+  
+  #mchr
+  "mchr1a", "mchr1b", "mchr2a", 
+  
+  #Adenosine recepotors
+  "adora1b",
+  "adora2ab", 
+  "adora2b"
+  
+)) + RotatedAxis()
+```
+
+# . Target gene DEGs
+```{r}
+target_genes <- c(
+  "pmch", "pmchl",
+  "mchr1a", "mchr1b", "mchr2a",
+  "adora1b", "adora2ab", "adora2b"
+)
+```
+
+## Whole brain
+```{r}
+pb <- AggregateExpression(
+  lSeq,
+  assays        = "RNA",
+  group.by      = c("population", "sample_id", "finalbroadcelltypes"),
+  return.seurat = TRUE
+)
+
+cts <- GetAssayData(pb, assay = "RNA", layer = "counts")
+
+coldata <- pb@meta.data %>%
+  tibble::rownames_to_column("col_id") %>%     # rownames are the pseudo-bulk column IDs
+  transmute(
+    col_id     = col_id,
+    sample     = sample_id,
+    Population = factor(population, levels = c("surface", "cave")),
+    CellType   = finalbroadcelltypes
+  )
+```
+
+```{r}
+group1_cts <- c("Neuron", "Glia", "Other")
+DEGtargets_lSeq <- run_target_pb_by_celltype(cts, coldata, group1_cts, target_genes)
+head(DEGtargets_lSeq)
+#write.csv(DEGtargets_lSeq, "MCH_adenosine_target_DE_lSeq_broad.csv", row.names = FALSE)
+```
+
+## Neurons
+```{r}
+pb <- AggregateExpression(
+  lSeqNeuroLB,
+  assays        = "RNA",
+  group.by      = c("population", "sample_id", "celltype"),
+  return.seurat = TRUE
+)
+
+cts <- GetAssayData(pb, assay = "RNA", layer = "counts")
+
+coldata <- pb@meta.data %>%
+  tibble::rownames_to_column("col_id") %>%     # rownames are the pseudo-bulk column IDs
+  transmute(
+    col_id     = col_id,
+    sample     = sample_id,
+    Population = factor(population, levels = c("surface", "cave")),
+    CellType   = celltype
+  )
+```
+
+```{r}
+group2_cts <- levels(Idents(lSeqNeuroLB))
+DEGtargets_Neuro <- run_target_pb_by_celltype(cts, coldata, group2_cts, target_genes)
+head(DEGtargets_Neuro)
+write.csv(DEGtargets_Neuro, "MCH_adenosine_target_DE_Neuro_broad.csv", row.names = FALSE)
+```
+### i2 DEGs
+```{r}
+GlyHB_out <- deseq2_pb_celltype(cts, coldata, "i2", fdr_explore = 0.05)
+
+res_GlyHB <- GlyHB_out$res_all
+dds_GlyHB<- GlyHB_out$dds
+```
+```{r}
+library(ggplot2)
+library(ggrepel)
+library(dplyr)
+
+# res = your DESeq2 results table for ONE cell type
+
+de.volc <- res_GlyHB  %>%
+  mutate(
+    logP = -log10(padj),
+
+    sig = case_when(
+      padj <= 0.05 & log2FoldChange_shrunk > 0 ~ "Up in Cave",
+      padj <= 0.05 & log2FoldChange_shrunk < 0 ~ "Up in Surface",
+      TRUE ~ "Not sig"
+    ),
+
+    label = ifelse(gene == "adora2b", gene, NA)
+  )
+
+p <- ggplot(de.volc,
+            aes(x = log2FoldChange_shrunk,
+                y = logP,
+                color = sig)) +
+
+  geom_point(
+    position = position_jitter(width = 0, height = 0),
+    alpha = 0.7,
+    size = 1.5
+  ) +
+
+  # black outline circle around adora2b
+  # outlined version of ONLY adora2b
+  geom_point(
+    data = subset(de.volc, gene == "adora2b"),
+    aes(x = log2FoldChange_shrunk, y = logP),
+    shape = 21,
+    fill = NA,
+    color = "black",
+    stroke = 0.8,
+    size = 1.5,   # EXACTLY same as main geom_point size
+    inherit.aes = FALSE
+  ) +
+
+  geom_text_repel(
+    aes(label = label),
+    color = "black",
+    size = 3,
+    segment.color = "black",
+    segment.size = 0.4,
+    min.segment.length = 0,
+    na.rm = TRUE
+  ) +
+
+  scale_color_manual(values = c(
+    "Up in Cave" = "palevioletred",
+    "Up in Surface" = "darkseagreen3",
+    "Not sig" = "lightgray"
+  )) +
+
+  geom_vline(
+    xintercept = c(-1, 1),
+    linetype = "dashed",
+    color = "gray50"
+  ) +
+
+  geom_hline(
+    yintercept = -log10(0.05),
+    linetype = "dashed",
+    color = "gray50"
+  ) +
+
+  labs(
+    title = "Volcano Plot: Cave vs Surface",
+    x = "log2 Fold Change (Cave vs Surface)",
+    y = "-log10 Adjusted p-value",
+    color = "DE Category"
+  ) +
+
+  theme_minimal()
+
+print(p)
+
+ggsave("adora2b_volcano.pdf",
+       p,
+       width = 10,
+       height = 8,
+       dpi = 300)
+```
+
+
+
+
+## Glia
+```{r}
+pb <- AggregateExpression(
+  lSeqGliaGen,
+  assays        = "RNA",
+  slot          = "counts",
+  group.by      = c("population", "sample_id", "celltype"),
+  return.seurat = TRUE
+)
+
+cts <- GetAssayData(pb, assay = "RNA", layer = "counts")
+
+coldata <- pb@meta.data %>%
+  tibble::rownames_to_column("col_id") %>%     # rownames are the pseudo-bulk column IDs
+  transmute(
+    col_id     = col_id,
+    sample     = sample_id,
+    Population = factor(population, levels = c("surface", "cave")),
+    CellType   = celltype
+  )
+```
+
+```{r}
+group3_cts <- levels(Idents(lSeqGliaGen))
+DEGtargets_Glia <- run_target_pb_by_celltype(cts, coldata, group3_cts, target_genes)
+head(DEGtargets_Glia)
+write.csv(DEGtargets_Glia, "MCH_adenosine_target_DE_Glia_broad.csv", row.names = FALSE)
+```
+## Other
+```{r}
+pb <- AggregateExpression(
+  lSeqNonLB,
+  assays        = "RNA",
+  slot          = "counts",
+  group.by      = c("population", "sample_id", "celltype"),
+  return.seurat = TRUE
+)
+
+cts <- GetAssayData(pb, assay = "RNA", layer = "counts")
+
+coldata <- pb@meta.data %>%
+  tibble::rownames_to_column("col_id") %>%     # rownames are the pseudo-bulk column IDs
+  transmute(
+    col_id     = col_id,
+    sample     = sample_id,
+    Population = factor(population, levels = c("surface", "cave")),
+    CellType   = celltype
+  )
+```
+
+```{r}
+group4_cts <- levels(Idents(lSeqNonLB))
+DEGtargets_Other <- run_target_pb_by_celltype(cts, coldata, group4_cts, target_genes)
+head(DEGtargets_Other)
+write.csv(DEGtargets_Other, "MCH_adenosine_target_DE_Other_broad.csv", row.names = FALSE)
+```
+
+```{r}
+group1_cts <- c("Neurons", "Glia", "Other")
+group2_cts <- levels(Idents(lSeqNeurons))
+group3_cts <- levels(Idents(lSeqGlia))
+group4_cts <- levels(Idents(lSeqOther))
+
+mch_group1 <- run_target_pb_by_celltype(cts, coldata, group1_cts, target_genes)
+mch_group2 <- run_target_pb_by_celltype(cts, coldata, group2_cts, target_genes)
+mch_group3 <- run_target_pb_by_celltype(cts, coldata, group3_cts, target_genes)
+mch_group4 <- run_target_pb_by_celltype(cts, coldata, group4_cts, target_genes)
+
+write.csv(mch_group1, "MCH_adenosine_target_DE_group1_broad.csv", row.names = FALSE)
+write.csv(mch_group2, "MCH_adenosine_target_DE_group2_neurons.csv", row.names = FALSE)
+write.csv(mch_group3, "MCH_adenosine_target_DE_group3_glia.csv", row.names = FALSE)
+write.csv(mch_group4, "MCH_adenosine_target_DE_group4_other.csv", row.names = FALSE)
+```
+
+
+
+
+
+
+
+
+
+

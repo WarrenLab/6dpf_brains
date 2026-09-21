@@ -1,0 +1,1355 @@
+---
+title: "Whole brain clustering"
+output: 
+  html_notebook: 
+    toc: true
+    theme: cerulean
+    number_sections: true
+---
+
+# . Environment
+## Load libraries
+```{r}
+#convert from .h5ad
+library(zellkonverter)
+library(SingleCellExperiment)
+library(Matrix)
+
+# Seurat
+library(Seurat)
+library(clustree)
+
+# General
+library(dplyr)
+library(ggplot2)
+```
+
+## define functions
+### Run binomial glm
+```{r}
+run_binomial_glm <- function(seurat_obj, group_var) {
+  library(dplyr)
+  library(tidyr)
+  library(purrr)
+  library(broom)
+  
+  # Extract metadata
+  df <- seurat_obj@meta.data
+  
+  # Ensure required columns exist
+  if (!all(c("population", "sample_id", group_var) %in% colnames(df))) {
+    stop("Metadata must contain: population, sample_id, and the specified group_var.")
+  }
+  
+  # Relevel population and factorize inputs
+  df <- df %>%
+    mutate(
+      population = relevel(factor(population), ref = "surface"),
+      sample_id  = factor(sample_id),
+      !!group_var := factor(.data[[group_var]])
+    )
+  
+  # Summarize counts per (sample × group_var)
+  sample_sums <- df %>%
+    group_by(sample_id, population, !!sym(group_var)) %>%  # sym() avoids tidyselect
+    summarise(count = n(), .groups = "drop")
+  
+  # Total per sample
+  total_by_sample <- sample_sums %>%
+    group_by(sample_id) %>%
+    summarise(total = sum(count), .groups = "drop")
+  
+  # Add "non" counts
+  sample_sums <- sample_sums %>%
+    left_join(total_by_sample, by = "sample_id") %>%
+    mutate(non = total - count)
+  
+  # GLM function
+  fit_binom <- function(df_sub) {
+    glm(cbind(count, non) ~ population,
+        family = binomial,
+        data = df_sub)
+  }
+  
+  # Fit per group_var level
+  glm_results <- sample_sums %>%
+    rename(group = !!sym(group_var)) %>%    # safe non-tidyselect
+    group_by(group) %>%
+    nest() %>%
+    mutate(
+      model = map(data, fit_binom),
+      tidy  = map(model, broom::tidy)
+    ) %>%
+    select(group, tidy) %>%
+    unnest(tidy)
+  
+  # Final cleaned results
+   glm_effects <- glm_results %>%
+    filter(term != "(Intercept)") %>%
+    mutate(
+      odds_ratio = exp(estimate),
+      p_adj_num  = p.adjust(p.value, method = "fdr"),
+      p_adj      = format.pval(p_adj_num, digits = 3, eps = 1e-300)
+    ) %>%
+    select(-p_adj_num) %>%
+    arrange(p.value)
+  
+  return(glm_effects)
+}
+```
+### Annotation - DEGs across cell types
+```{r}
+deseq2_pb_annotation <- function(
+  cts,
+  coldata,
+  target_celltype,
+  ref_celltypes = NULL,
+  fdr_explore = 0.20,
+  min_total_count = 10,
+  min_samples = 2
+) {
+
+  stopifnot(is.matrix(cts) || inherits(cts, "dgCMatrix"))
+  stopifnot(all(c("col_id","sample","Population","CellType") %in% colnames(coldata)))
+
+  # clean coldata
+  coldata <- as.data.frame(coldata, stringsAsFactors = FALSE)
+  coldata$col_id     <- as.character(coldata$col_id)
+  coldata$sample     <- as.character(coldata$sample)
+  coldata$Population <- as.character(coldata$Population)
+  coldata$CellType   <- as.character(coldata$CellType)
+
+  # USE BOTH POPULATIONS for annotation (no subsetting)
+  cd <- coldata
+  if (nrow(cd) == 0) stop("coldata is empty after cleaning.")
+
+  # optionally restrict which “other” celltypes are allowed
+  if (!is.null(ref_celltypes)) {
+    keep_cts <- unique(c(ref_celltypes, target_celltype))
+    cd <- cd[cd$CellType %in% keep_cts, , drop = FALSE]
+    if (nrow(cd) == 0) stop("After ref_celltypes filtering, nothing left.")
+  }
+
+  # need at least some target samples
+  if (!any(cd$CellType == target_celltype)) {
+    stop("No pseudobulk columns for target celltype: ", target_celltype)
+  }
+
+  # align counts to cd
+  stopifnot(all(cd$col_id %in% colnames(cts)))
+  cts2 <- cts[, cd$col_id, drop = FALSE]
+
+  # define target vs other
+  cd$is_target <- ifelse(cd$CellType == target_celltype, "target", "other")
+  cd$is_target <- factor(cd$is_target, levels = c("other","target"))
+
+  # Prefilter genes: expressed in at least min_samples pseudobulk columns at >= min_total_count
+  keep <- Matrix::rowSums(cts2 >= min_total_count) >= min_samples
+  cts2 <- cts2[keep, , drop = FALSE]
+  if (nrow(cts2) == 0) stop("All genes filtered out; relax thresholds.")
+
+  # DESeq2 colData must match column order
+  cd2 <- cd[match(colnames(cts2), cd$col_id), , drop = FALSE]
+  stopifnot(identical(colnames(cts2), cd2$col_id))
+  rownames(cd2) <- cd2$col_id
+
+  # IMPORTANT: sample as a blocking factor (paired within sample)
+  cd2$sample    <- factor(cd2$sample)
+  cd2$is_target <- factor(cd2$is_target, levels = c("other","target"))
+
+  dds <- DESeq2::DESeqDataSetFromMatrix(
+    countData = round(cts2),
+    colData   = cd2,
+    design    = ~ sample + is_target
+  )
+
+  # sanity: need both target and other
+  if (length(unique(cd2$is_target)) < 2) {
+    stop("Need both target and other columns after filtering.")
+  }
+
+  dds <- DESeq2::DESeq(dds)
+
+  # results for target vs other
+  res <- DESeq2::results(
+    dds,
+    contrast = c("is_target","target","other"),
+    alpha = fdr_explore
+  ) |>
+    as.data.frame() |>
+    tibble::rownames_to_column("gene")
+
+  res_all <- res |>
+    dplyr::arrange(padj, dplyr::desc(baseMean))
+
+  res_sig <- res_all |>
+    dplyr::filter(!is.na(padj), padj < fdr_explore)
+
+  list(
+    dds             = dds,
+    res_sig         = res_sig,
+    res_all         = res_all,
+    target_celltype = target_celltype,
+    fdr_explore     = fdr_explore
+  )
+}
+```
+##### Export single cell type significant DEGs to csv
+```{r}
+format_and_write_annotation_csv <- function(
+  res_df,
+  neuro_cluster_label,          # e.g. "e2_tectum"
+  padj_cut = 0.05,
+  lfc_abs_min = 0,
+  top_n = 100,
+  drop_LOC = TRUE,
+  loc_regex = "^LOC",
+  extra_drop_regex = NULL
+) {
+
+  stopifnot(all(c("gene","padj","baseMean") %in% colnames(res_df)))
+
+  df <- res_df
+
+  # Optional filtering of LOC / unwanted symbols
+  if (drop_LOC) {
+    df <- df %>% filter(!grepl(loc_regex, gene))
+  }
+  if (!is.null(extra_drop_regex)) {
+    df <- df %>% filter(!grepl(extra_drop_regex, gene))
+  }
+
+  # Keep significant genes
+  df <- df %>% filter(!is.na(padj), padj <= padj_cut)
+
+  # Determine which LFC column to use
+  lfc_col <- if ("log2FoldChange_shrunk" %in% colnames(df)) {
+    "log2FoldChange_shrunk"
+  } else if ("log2FoldChange" %in% colnames(df)) {
+    "log2FoldChange"
+  } else {
+    stop("res_df must contain log2FoldChange or log2FoldChange_shrunk")
+  }
+
+  # Keep only TARGET-ENRICHED genes
+  df <- df %>% filter(.data[[lfc_col]] > 0)
+
+  # Optional LFC threshold
+  if (lfc_abs_min > 0) {
+    df <- df %>% filter(abs(.data[[lfc_col]]) >= lfc_abs_min)
+  }
+
+  # Add direction column (useful for sanity checks)
+  df <- df %>%
+    mutate(direction = "Up in target")
+
+  # Rank by: significance → specificity → expression
+  df_out <- df %>%
+    arrange(padj, desc(abs(.data[[lfc_col]])), desc(baseMean)) %>%
+    slice_head(n = top_n)
+
+  # Column order (clean CSV)
+  preferred <- c("gene","baseMean",lfc_col,"padj","pvalue","stat","lfcSE","direction")
+  keep_cols <- c(preferred, setdiff(colnames(df_out), preferred))
+  df_out <- df_out %>% select(any_of(keep_cols))
+
+  # Write directly to WORKING DIRECTORY
+  fname <- paste0(neuro_cluster_label, ".csv")
+  readr::write_csv(df_out, fname)
+
+  message("Wrote annotation DEG CSV to: ", normalizePath(fname))
+
+  return(df_out)
+}
+```
+
+##### Export all cell type markers with log2fold change cutoff
+```{r}
+run_all_celltype_deg_exports <- function(
+  cts,
+  coldata,
+  padj_cut = 0.05,
+  lfc_min = 1,
+  positive_only = TRUE,
+  out_csv = "AllCellTypes_DEGs_filtered.csv",
+  verbose = TRUE
+) {
+  suppressPackageStartupMessages({
+    library(dplyr)
+    library(readr)
+  })
+
+  stopifnot(is.matrix(cts) || inherits(cts, "dgCMatrix"))
+  stopifnot(all(c("col_id","sample","Population","CellType") %in% colnames(coldata)))
+
+  cd <- as.data.frame(coldata, stringsAsFactors = FALSE)
+  celltypes <- sort(unique(cd$CellType))
+  celltypes <- celltypes[!is.na(celltypes) & celltypes != ""]
+
+  if (length(celltypes) == 0) stop("No celltypes found in coldata.")
+
+  results_list <- vector("list", length(celltypes))
+  names(results_list) <- celltypes
+
+  failures <- list()
+
+  for (ct in celltypes) {
+    if (isTRUE(verbose)) message("Running DESeq2 for: ", ct)
+
+    out <- try(
+      deseq2_pb_annotation(
+        cts = cts,
+        coldata = cd,
+        target_celltype = ct
+      ),
+      silent = TRUE
+    )
+
+    if (inherits(out, "try-error")) {
+      failures[[ct]] <- as.character(out)
+      next
+    }
+
+    df <- out$res_all %>%
+      mutate(celltype = ct) %>%
+      select(celltype, gene, padj, log2FoldChange, lfcSE, pvalue, baseMean) %>%
+      filter(!is.na(padj), padj <= padj_cut) %>%
+      filter(!is.na(log2FoldChange))
+
+    if (positive_only) {
+      df <- df %>%
+        filter(log2FoldChange >= lfc_min)
+    } else {
+      df <- df %>%
+        filter(abs(log2FoldChange) >= lfc_min)
+    }
+
+    df <- df %>%
+      arrange(celltype, desc(log2FoldChange), padj, desc(baseMean))
+
+    results_list[[ct]] <- df
+  }
+
+  combined_results <- bind_rows(results_list)
+
+  readr::write_csv(combined_results, out_csv)
+
+  if (isTRUE(verbose)) {
+    message("Wrote filtered DEG file: ", normalizePath(out_csv))
+    if (length(failures) > 0) {
+      message("Some cell types failed. Check returned $failures.")
+    }
+  }
+
+  return(list(
+    degs = combined_results,
+    failures = failures
+  ))
+}
+```
+
+### Plotting
+#### UMAP arrows for coord axis
+```{r}
+mini_axis_umap <- function(
+  seurat_obj,
+  reduction = "umap",
+  group.by = NULL,
+  split.by = NULL,
+  label = TRUE,
+  shuffle = TRUE,
+  alpha = 0.8,
+  pt.size = 0.5,
+  axis_frac = 0.08,
+  pad_frac  = 0.03,
+  arrow_mm  = 2,
+  linewidth = 0.5,
+  add_labels = TRUE,
+  label_x = "UMAP 1",
+  label_y = "UMAP 2",
+  label_size = 3,
+  margin_mm = 5.5,
+  seed = NULL
+) {
+  stopifnot(inherits(seurat_obj, "Seurat"))
+
+  if (!is.null(seed)) set.seed(seed)
+
+  # 1) Base DimPlot
+  p <- DimPlot(
+    seurat_obj,
+    reduction = reduction,
+    group.by = group.by,
+    split.by = split.by,
+    label = label,
+    shuffle = shuffle,
+    alpha = alpha,
+    pt.size = pt.size
+  ) + NoLegend()
+
+  # 2) Remove axes completely
+  p_clean <- p +
+    theme_void() +
+    theme(plot.margin = margin(margin_mm, margin_mm, margin_mm, margin_mm, unit = "mm")) +
+    NoLegend()
+
+  # 3) Compute panel ranges
+  gb <- ggplot_build(p_clean)
+  pp <- gb$layout$panel_params[[1]]
+  x_rng <- pp$x.range
+  y_rng <- pp$y.range
+
+  x_span <- diff(x_rng)
+  y_span <- diff(y_rng)
+
+  # Bottom-left corner position (with padding)
+  x0 <- x_rng[1] + pad_frac * x_span
+  y0 <- y_rng[1] + pad_frac * y_span
+
+  # Mini-axis lengths
+  dx <- axis_frac * x_span
+  dy <- axis_frac * y_span
+
+  # 4) Add mini-axes + optional labels
+  p_final <- p_clean +
+    annotate(
+      "segment",
+      x = x0, xend = x0 + dx,
+      y = y0, yend = y0,
+      linewidth = linewidth,
+      arrow = arrow(type = "closed", length = unit(arrow_mm, "mm"))
+    ) +
+    annotate(
+      "segment",
+      x = x0, xend = x0,
+      y = y0, yend = y0 + dy,
+      linewidth = linewidth,
+      arrow = arrow(type = "closed", length = unit(arrow_mm, "mm"))
+    )
+
+  if (isTRUE(add_labels)) {
+    p_final <- p_final +
+      annotate(
+        "text",
+        x = x0 + dx, y = y0 - 0.01 * y_span,
+        label = label_x, hjust = 1, vjust = 1, size = label_size
+      ) +
+      annotate(
+        "text",
+        x = x0 - 0.01 * x_span, y = y0 + dy,
+        label = label_y, hjust = 1, vjust = 1, angle = 90, size = label_size
+      )
+  }
+
+  return(p_final)
+}
+```
+
+# . Data
+skip to load data - conversion to lSeq from python output included for transparency
+## read in python files 
+```{r}
+# sce_counts <- readH5AD("raw_counts.h5ad")
+# sce_lognorm <- readH5AD("initial_clusters_all_resolutions_RAWasX.h5ad")
+# sce_scaled  <- readH5AD("initial_clusters_all_resolutions.h5ad")
+```
+### change dim names in scaled data and extract highest resolution leiden clustering
+```{r}
+# if (!is.null(sce_scaled@int_colData$reducedDims)) {
+#   if (!is.null(sce_scaled@int_colData$reducedDims$X_pca)) {
+#     reducedDim(sce_scaled, "X_pca") <- sce_scaled@int_colData$reducedDims$X_pca
+#   }
+#   if (!is.null(sce_scaled@int_colData$reducedDims$X_pca_harmony)) {
+#     reducedDim(sce_scaled, "X_pca_harmony") <- sce_scaled@int_colData$reducedDims$X_pca_harmony
+#   }
+#   if (!is.null(sce_scaled@int_colData$reducedDims$X_umap)) {
+#     reducedDim(sce_scaled, "X_umap") <- sce_scaled@int_colData$reducedDims$X_umap
+#   }
+# }
+# 
+# #Fix column names for each embedding matrix
+# if ("X_pca" %in% reducedDimNames(sce_scaled)) {
+#   colnames(reducedDim(sce_scaled, "X_pca")) <- paste0("PC_", seq_len(ncol(reducedDim(sce_scaled, "X_pca"))))
+# }
+# if ("X_pca_harmony" %in% reducedDimNames(sce_scaled)) {
+#   colnames(reducedDim(sce_scaled, "X_pca_harmony")) <- paste0("Harmony_", seq_len(ncol(reducedDim(sce_scaled, "X_pca_harmony"))))
+# }
+# if ("X_umap" %in% reducedDimNames(sce_scaled)) {
+#   colnames(reducedDim(sce_scaled, "X_umap")) <- paste0("UMAP_", seq_len(ncol(reducedDim(sce_scaled, "X_umap"))))
+# }
+# 
+# #Rename them to match Seurat-friendly names
+# if ("X_pca" %in% reducedDimNames(sce_scaled)) {
+#   reducedDim(sce_scaled, "pca") <- reducedDim(sce_scaled, "X_pca")
+# }
+# if ("X_pca_harmony" %in% reducedDimNames(sce_scaled)) {
+#   reducedDim(sce_scaled, "harmony") <- reducedDim(sce_scaled, "X_pca_harmony")
+# }
+# if ("X_umap" %in% reducedDimNames(sce_scaled)) {
+#   reducedDim(sce_scaled, "umap") <- reducedDim(sce_scaled, "X_umap")
+# }
+# 
+# # remove old ones to avoid confusion
+# keep_rd <- intersect(c("pca", "harmony", "umap"), reducedDimNames(sce_scaled))
+# if (length(keep_rd) > 0) {
+#   reducedDims(sce_scaled) <- reducedDims(sce_scaled)[keep_rd]
+# }
+# 
+# # -----------------------------
+# # Subset to leiden_1.20 cells
+# # -----------------------------
+# if (!"leiden_1.20" %in% colnames(colData(sce_scaled))) stop("sce_scaled is missing 'leiden_1.20' in colData.")
+# 
+# cells_120 <- colnames(sce_scaled)  # all cells in this object already have leiden labels
+# sce_counts  <- sce_counts[,  cells_120]
+# sce_lognorm <- sce_lognorm[, cells_120]
+# sce_scaled  <- sce_scaled[,  cells_120]
+# 
+# stopifnot(
+#   identical(colnames(sce_counts),  colnames(sce_scaled)),
+#   identical(colnames(sce_lognorm), colnames(sce_scaled))
+# )
+
+```
+
+### Convert to seurat object
+#### Build Seurat object from raw counts matrix 
+```{r}
+# counts_mat <- assay(sce_counts, "X")
+# if (!inherits(counts_mat, "dgCMatrix")) counts_mat <- as(counts_mat, "dgCMatrix")
+# 
+# meta <- as.data.frame(colData(sce_scaled)[, c("sample_id", "population", "leiden_1.20"), drop = FALSE])
+# 
+# seu <- CreateSeuratObject(
+#   counts = counts_mat,
+#   assay  = "RNA",
+#   meta.data = meta
+# )
+# 
+# DefaultAssay(seu) <- "RNA"
+```
+
+#### Add normalization to Data
+```{r}
+# lognorm_mat <- assay(sce_lognorm, "X")
+# lognorm_mat <- lognorm_mat[, colnames(seu), drop = FALSE]
+# 
+# seu <- SetAssayData(
+#   object  = seu,
+#   assay   = "RNA",
+#   layer   = "data",
+#   new.data = lognorm_mat
+# )
+```
+
+#### Add scaled highly variable features
+```{r}
+# scaled_mat <- assay(sce_scaled, "X")
+# scaled_mat <- scaled_mat[, colnames(seu), drop = FALSE]
+# 
+# hvg <- intersect(rownames(scaled_mat), rownames(seu))
+# if (length(hvg) == 0) stop("No overlapping HVG features between scaled and Seurat features.")
+# 
+# scaled_mat <- scaled_mat[hvg, , drop = FALSE]
+# VariableFeatures(seu) <- hvg
+# 
+# seu <- SetAssayData(
+#   object  = seu,
+#   assay   = "RNA",
+#   layer   = "scale.data",
+#   new.data = scaled_mat
+# )
+```
+
+#### Add reductions from SCE (pca/harmony/umap)
+```{r}
+# add_rd <- function(seu, sce, rd, key) {
+#   if (!rd %in% reducedDimNames(sce)) return(seu)
+#   emb <- reducedDim(sce, rd)
+#   emb <- emb[colnames(seu), , drop = FALSE]
+#   # Keep existing colnames (we already set them), but ensure they exist
+#   if (is.null(colnames(emb))) colnames(emb) <- paste0(key, seq_len(ncol(emb)))
+#   seu[[rd]] <- CreateDimReducObject(embeddings = emb, key = key, assay = "RNA")
+#   seu
+# }
+# 
+# seu <- add_rd(seu, sce_scaled, "pca",     "PC_")
+# seu <- add_rd(seu, sce_scaled, "harmony", "Harmony_")
+# seu <- add_rd(seu, sce_scaled, "umap",    "UMAP_")
+# 
+# #  Leiden -> seurat_clusters 
+# seu$seurat_clusters <- factor(seu$leiden_1.20)
+# Idents(seu) <- "seurat_clusters"
+```
+
+## save
+```{r}
+# lSeq <- seu
+ SaveSeuratRds(lSeq, "lSeq.rds")
+```
+
+## load
+```{r}
+lSeq <-readRDS("lSeq.rds")
+```
+
+
+## QC plots
+### UMAPs for integration
+POPULATION
+```{r}
+lSeq$population <- factor(lSeq$population, levels = c("surface", "cave"))
+
+DimPlot(lSeq, reduction = "umap", group.by = "population", label = FALSE,pt.size = 0.25,
+   cols = c("darkseagreen","palevioletred"))
+
+#ggsave("lSeqPopulationUMAP.pdf",  width = 10, height = 8, dpi = 300)
+
+```
+SAMPLE
+```{r}
+
+DimPlot(lSeq, reduction = "umap", group.by = "sample_id", label = FALSE,pt.size = 0.25)
+
+#ggsave("lSeqSampleUMAP.pdf",  width = 10, height = 8, dpi = 300)
+
+```
+### QC cutoffs plots
+```{r}
+Idents(lSeq) <- lSeq$sample_id
+```
+
+#### ribos
+```{r}
+#create column of ribosomal gene expression percentage
+lSeq[["percent.ribo"]] <- PercentageFeatureSet(
+  lSeq, 
+  pattern = "^[Rr][Pp][LlSs]"
+)
+```
+```{r}
+
+VlnPlot(
+  lSeq,
+  features = "percent.ribo",
+  pt.size = 0,
+  adjust = 5
+)  + NoLegend()
+
+
+ggsave("lSeqRiboViolin.pdf",  width = 10, height = 8, dpi = 300)
+
+```
+
+```{r}
+VlnPlot(
+  lSeq,
+  features = "percent.ribo",
+  group.by = "population",
+  cols = c("darkseagreen","palevioletred"),
+  pt.size = 0,
+   adjust = 5
+) + NoLegend()
+
+#ggsave("Ribo_by_population_violin.pdf", width = 6, height = 4, dpi = 300)
+```
+
+#### genes
+```{r}
+VlnPlot(lSeq, features = c("nFeature_RNA"), pt.size = 0,  adjust = 5)  + NoLegend()
+#ggsave("lSeqGenesViolin.pdf",  width = 10, height = 8, dpi = 300)
+```
+```{r}
+VlnPlot(
+  lSeq,
+  features = "nFeature_RNA",
+  group.by = "population",
+  cols = c("darkseagreen","palevioletred"),
+  pt.size = 0
+) + NoLegend()
+
+#ggsave("Genes_by_population_violin.pdf", width = 6, height = 4, dpi = 300)
+```
+
+#### UMIs
+```{r}
+VlnPlot(lSeq, features = c("nCount_RNA"), pt.size = 0,  adjust = 5)  + NoLegend()
+#ggsave("lSeqUMIViolin.pdf",  width = 10, height = 8, dpi = 300)
+```
+
+```{r}
+VlnPlot(
+  lSeq,
+  features = "nCount_RNA",
+  group.by = "population",
+  cols = c("darkseagreen","palevioletred"),
+  pt.size = 0
+) + NoLegend()
+
+#ggsave("UMI_by_population_violin.pdf", width = 6, height = 4, dpi = 300)
+```
+
+## properties
+### cell count totals
+```{r}
+# total cells
+n_total_cells <- ncol(lSeq)
+
+# cells per population
+cells_by_pop <- table(lSeq$population)
+
+n_total_cells
+cells_by_pop
+```
+### UMIs
+#### total
+```{r}
+mean_umis <- mean(lSeq$nCount_RNA)
+median_umis <- median(lSeq$nCount_RNA)
+
+mean_umis
+median_umis
+```
+
+#### by pop
+```{r}
+umis_by_pop <- lSeq@meta.data %>%
+  group_by(population) %>%
+  summarize(
+    mean_umis   = mean(nCount_RNA),
+    median_umis = median(nCount_RNA),
+    .groups = "drop"
+  )
+
+umis_by_pop
+```
+#### stats
+sample level - surface and cave populations counts are not significantly different across samples
+```{r}
+sample_qc <- lSeq@meta.data %>%
+  group_by(sample_id, population) %>%
+  summarize(
+    median_umis = median(nCount_RNA),
+    mean_umis   = mean(nCount_RNA),
+    .groups = "drop"
+  )
+
+sample_qc
+
+wilcox.test(median_umis ~ population, data = sample_qc)
+```
+
+```{r}
+p_val <- wilcox.test(median_umis ~ population, data = sample_qc)$p.value
+
+ggplot(sample_qc, aes(x = population, y = median_umis)) +
+  geom_violin(trim = FALSE) +
+  geom_jitter(width = 0.1, size = 2) +
+  theme_classic() +
+  annotate(
+    "text",
+    x = 1.5,
+    y = max(sample_qc$median_umis) * 1.05,
+    label = paste0("Wilcoxon p = ", signif(p_val, 2))
+  ) +
+  labs(
+    x = NULL,
+    y = "Median UMIs per cell (per sample)"
+  )
+```
+
+### genes
+```{r}
+median(lSeq$nFeature_RNA)
+```
+
+# . Annotate by major cell type group
+Clusters initially annotated as neurons, glia, or other
+## Qick sort by module score
+### Gene list
+LOC125803969 = mrc1b
+```{r}
+neuronal_markers <- c(
+  "elavl2","elavl3", "elavl4", "rbfox3a", "snap25a",
+  "slc17a6a", "slc17a6b", "slc17a7a", "slc17a7b", "slc17a8",
+  "gad1a", "gad1b", "gad2",
+  "slc6a5", "slc32a1", "sv2a", "vamp2",
+  "mao", "ddc", "tph1a", "tph1b", "tph2",
+  "th", "slc6a3", "th2", "slc18a2", "hrh3",
+  "chata", "slc18a3a", "slc18a3b", "oxt", "hcrt"
+)
+
+glial_markers <- c(
+  # Astrocytes & radial glia
+  "fabp7a", "LOC103040661", "her9", "slc1a2b", "s100b",
+  "sox2", "LOC103035120", "slc1a3b", "glula",
+  "kcnj10a", "slc6a11b", "fgfr3", "fgfr4", "ptn",
+  "aqp4", "slc1a2b", "mlc1", "ptprz1a", 
+  "dla", "ccnd1", "mki67", "her2", "uhrf1",
+  "pcna", "stil", "cdca3", "cdca7a", "s100b",
+  
+  # Oligodendrocyte lineage
+  "olig2", "sox10", "plp1b", "pdgfra", "col9a3",
+  "matn4", "mbpa", "bcan", "cntn1b",
+  "olig1", "myt1b", "cspg4", "ptprfa",
+  "lingo1a", "lingo1b", "plppr2b", "mbpb", "plp1a",
+  "mpz", "mag", "cldnk", "cldn19", "gldn", "cd9b",
+  "myrf", "qki2", "bcas1", "rundc3aa",
+  "sall1b", "enpp6", "ugt8", "gal3st1a",
+  
+  # Microglia/macrophages
+  "irf1a", "stat4", "parp9", "socs3b", "il12rb2",
+  "mavs", "ptprc", "ackr4b", "coro1a", "fadd",
+  "ccl44", "ccl25a", "csf1rb", "havcr2",
+  "il1rl1", "tlr3", "irf1a", "stat4", "parp9",
+  "socs3b", "il12rb2", "mavs", "ptprc", "ackr4b",
+  "coro1a", "fadd", "ccl44", 
+  "tmem119a", "p2ry12", "marco", "fybb", "csf1ra",
+  "csf1rb", "ptprc", "rraga", "havcr1", "slc7a7",
+  "ptpn6", "lyn", "spi1b", "c1qa", "c1qb", "c1qc",
+  "csf2rb", "cd68", "LOC103034161", "spi1a",
+  "LOC125803969", "myo1f",
+  "epor", "hbbe1.1", "klf1", "lyl1", "myo1g",
+  "grna", "ctsba", "ctsd", "ctsz", "lyz",
+  "rac2", "ncf1", "ncf2", "ncf4", "ctsk",
+  "rubcnl", "bin2b", "ctsc", "ctsh",
+  "mafba", "runx1", "lcp1", "coro1a", "irf8",
+  "irf5", "cd4-1", "cd8a", "cd8b", "il10ra",
+  "tnfsf11", "il6", "il6r",
+  
+  # Ependymal - cilliated
+  "dnah7", "dnah9", "tekt1", "tekt2", "tekt3",
+  "cfap61", "cfap52", "cfap53", "foxj1b", "dnajc22",
+  "tppp3", "ttc21a", "ccdc78", "dnah1", "dnah2",
+  "dnah3", "dnah5l", "dnai2b", "dnai4",
+  "cfap52", "cfap53", "cfap61", "cfap73",
+  "cfap91", "cfap99", "cfap276", "spag6",
+  "spag17", "spef1", "rsph3", "ccdc33",
+  "ccdc40", "ccdc96", "ccdc146", "kif9"
+)
+
+other_markers <- c(
+  "cldn5b", "vtnb", "acta2", "myh11a", 
+  "col1a1a", "col2a1a", "epcam", "kdrl", "cldn5a", "pld1a", "mcamb", "kcne4", "rasl12",
+  "slc47a2.1", "slc4a7", "slc5a6a", "slc16a9a", "col8a1a", "slc13a4", "soul5", "igfbp2a", 
+  "ndufa4l2a","kcnj8", "rgs5a", "abcc9", "col9a2", "matn1",
+  
+  # Chondrocyte markers
+  "trpv4", "adamts3", "ddr2a", "ddr2b", "papss2a", "papss2b", "vit", "ptger1b", "itga10",
+  "itga11a", "tgfb5", "fgfr3", "fgfrl1b", "pdgfrl",
+
+  # Core ECM and cartilage structure
+  "acana", "acanb", "col2a1a", "col9a1a", "col9a2", "col9a3",
+  "col11a1a", "col11a2", "col27a1a", "col27a1b", "matn1", "matn4", "epyc",
+    
+  # Cartilage regulators and modifiers
+  "sox9a", "sox5", "sox6", "fgfr3", "fgfrl1b", "fgf2", "tgfb5",
+    
+  # Chondroitin synthesis and sulfation
+  "papss2a", "chst3a", "chst3b", "chst7", "has3", "slc35d1a", "csgalnact1a", "xylt1",
+    
+  # Matrix crosslinking and assembly
+  "loxl3a", "loxl3b", "serpinh1b", "snorc", "dpp4", "cthrc1b", "frzb",
+ 
+  # Skeletal muscle 
+  ## actin_regulators
+  "synpo2la", "synpo2lb", "smpx", "fhl2a", "coro6", "unc45b",
+
+  ## sarcomeric_ion_channels
+  "ryr1a", "atp2a1", "cacng1a", "cacng6a", "cacng6b", "slc8a1a",
+
+  ## neuromuscular_junction
+  "chrna1", "chrnd", "chrng", "rapsn", "dok7b", "musk",
+
+  ## Sarcomere and contractile machinery
+  "acta1a", "acta1b", "actc1a", "actc1b", "actn3a", "actn3b",
+  "myom1a", "myom2a", "myom2b", "myoz1a", "myoz1b", "myoz2a", "myl1", "mylpfa", 
+  "tnnt3a", "neb", "desma", "klhl31", "klhl43", "klhl41b", "trim63a", "trim63b",
+
+  ## muscle_regulators
+  "myod1", "myf6", "mef2ca", "smyd1a", "smyd1b", "myf5","sh3bgr", "rbfox1l", 
+  "ankrd1a", "xirp2a", "xirp2b", "coro6",
+
+  ## Calcium handling and excitation-contraction coupling
+  "atp2a1", "atp2a1l", "casq1b", "casq2", "ryr3", "cacna1ia", "cacna1sb",
+  "jph2", "srl", "hrc", "plpp7a",
+
+  ## Energy metabolism
+  "ckma", "ckmb", "pfkmb", "aldoab", "gapdh", "pgam2", "pkmb", "gamt", "mdh1ab", "pdia8", "atp5f1b",
+
+  # Endothelial markers
+  "cdh5", "pecam1a", "pecam1b", "tie1", "tek", "flt1", "kdrl", "ptprb", "esama", "eng",
+  "vwf","plvapb",
+
+  ## Tight junction & BBB-related
+  "cldn5a", "cldn5b", "jam2a", "podxl",
+
+  ## Transporters / BBB-associated
+  "slc2a1a", "slco1c1", "slc7a5", "abcg2a", "abcb4",
+  
+  ## Angiogenic transcription factors & signaling
+  "sox7", "egfl7", "dll4",  "notchl", "lyve1a", "gpr182", "gpr183a", 
+
+  ## Collagens
+  "col6a1", "col6a2", "col6a4a", "col5a1", "col5a2a", "col10a1a",
+  "col11a1b", "col12a1a", "col12a1b", "col21a1", "col22a1", "col8a2",
+
+  # Epidermal 
+  ## basal keratinocytes
+  "tp63","krt5", "krt15", 
+  "itgb4", "col17a1a", "col7a1", "col7a1l", 
+  "lamc2", "lama3", "lamc1","cd44a", "fn1a",                      
+  "barx2", "msx2a", "dlx3b",               
+
+  ## Structural keratinocyte/epidermal markers
+  "krt5", "krt15", "col7a1", "col7a1l", "col17a1a",
+
+  ## Epithelial junction/adhesion
+  "cldn1", "cldni", "cd44a", "itgb4", "itga6b", "itga3b", "lamc2", "lama5", "lamb3", "lamb4",
+
+  ## Developmental regulators
+  "tfap2c", "foxn1", "dlx3b", "shhb", "wnt3a", "wnt9b", "wnt10a",
+
+  ## Epithelial signaling and remodeling
+  "fgfbp1a", "adamts12", "mmp28", "mmp30", "postnb", "postna",
+
+  ## Cell surface / periderm-specific
+  "upk1a", "upk3b", "plp2a", "cxcl8a", "aqp3a", "aqp3b", "rbp4", "gpr84",
+  "grhl1", "grhl2a","anxa1a", "anxa5a",         
+  "tfap2c", "sp6", "arl13b", "odc1",              
+
+  # Perivascular / Meningeal / Mesenchymal-like markers
+  "aebp1a", "mfap2", "pmp22a", "tagln", "cxcl12a", "cd34", "angptl7", "plpp3",
+  "abi3bpb", "phldb2a", "twist2", "twist3", "prrx1a", "prrx1b", "alx4a", "runx2a", 
+    
+  ## mural lymphatic endothelial cells (muLECs)  
+  "epd","prox1a", "lyve1b", "mrc1a",  "slc13a4", "soul5",  "igfbp2a", "apof",
+  "ggctb",
+    
+  ## pericytes  
+  "cd248a", "pdgfrb", "notch3", "ndufa4l2a", "kcnj8", "rgs5a", "abcc9", "kcne4",
+  "hey1", "hey2", "tcf12", "tcf15", "col4a2", "myo1b",  
+    
+  ## vascular smooth muscle cells (vSMC)  
+  "acta2", "pdgfrb", "myh11a", "pln", "mcama", "mcamb",
+    
+  ## Meningeal Fibroblasts 
+  "lum", "dcn", "col1a1a", "fn1a", "postnb", "klf2a", "klf15", "six1a", "slc47a2.1", 
+  "slc4a7", "slc5a6a", "slc16a9a", "col8a1a", "aldh1a2", "col5a1", "meox2b", "tcf21",
+  "pdgfra", "twist1a",
+    
+  ## Adhesion, basal lamina
+  "cdh26.1", "cd44a", "cldn1", "epcam",
+  "itga3b", "itga6b", "itgb4", "lamc2", "lama5", "lamb3", "lamb4",
+  "col17a1a", "col7a1", "col4a4", "col4a5", "col4a6",
+    
+  ## Epidermal identity
+  "krt5", "krt15", "grhl2a", "foxn1", "sp6", "tp63", "wnt10a", "fgf24", "barx2", "dlx3b",
+
+  # Epithelial
+  "grhl1", "cd109", "cdx1b", "ehf", "elf3", "ace2", "esrp1", "esrp2", "gjb9a", "vgll1",
+  "ttr", "asl", "cldn1",
+    
+  ## tuft cells
+  "pou2f3", "grhl1", "cd109", "cdx1b", "ehf", "elf3",
+  "cldn1", "gjb9a", "esrp1", "esrp2",
+  "vgll1", "ttr", "asl", "ace2",
+   
+  ## Choroid plexus epithelium
+  "ttr",  "klf2a", "cfd", "slc4a5a", "slc4a5b", "cxcl12a", "foxj1a", "frzb",
+  "otop1", "foxi1",  "foxa3", "hnf1ba", "hnf1a", "hnf4a", "otog", "apoa1a" , "meis2b",
+  "crabp1a",
+   
+  ## Hair cells
+  # Core hair cell bundle & stereocilia genes
+  "pcdh15b", "ush1ga", "espn", "ptprq", "tmc2b", "myo15aa", "myo15ab",
+  
+  # Inner ear / lateral line specificity
+  "myo6b", "myo7bb", "cabp2b", "pjvk", "sytl2b", 
+  
+  # Supporting transcription factors and regulators
+  "gfi1ab", "gfi1aa", "foxj1b", "srrm4",
+  
+  # Ion regulation
+   "atp1b2b", "scn12aa",
+  
+  # Cell adhesion / epithelial
+  "cdhr2", "cdhr5b", "anxa5a", "espnla",
+
+  # Liver
+  "hnf4a", "hnf4b", "hnf4g","hnf1a", "hnf1ba", "hnf1bb",
+  "pck1", "gys2", "fabp10a", "fabp2","tat", "aldob", "arg1", "pklr", "bhmt",
+  "gpx3", "cdo1", "glud1a", "glud1b","apoa1b", "apoa4a", "apoba", "apoc1", "apoc2",
+  "apom", "c4b", "c5", "c8g", "c9", "f2", "f5", "f7", "f10", "fgg", "fgb", "kng1",
+  "serpinc1", "serpind1", "plg", "abcb11a", "abcb11b","slc2a2", "slc22a6l", "slc13a2",
+  "slc22a13b", "slc7a7", "slc5a1","soat2", "dgat1a", "dgat2", "mogat2", "mogat3b",
+  "nr1h4", "pparg", "pparda", "nr5a5", "fgf19", "ttr", "vtna", "klf15", "kl",
+  "selenop2","onecut2"
+)
+```
+### score cell type by top marker gene expression
+default bin size = 24
+```{r}
+lSeq <- AddModuleScore(lSeq, features = list(neuronal_markers), name = "NeuronScore")
+lSeq <- AddModuleScore(lSeq, features = list(glial_markers), name = "GliaScore")
+lSeq <- AddModuleScore(lSeq, features = list(other_markers), name = "OtherScore")
+
+# Classify by max score
+lSeq$cell_type <- apply(
+  lSeq@meta.data[, c("NeuronScore1", "GliaScore1", "OtherScore1")],
+  1,
+  function(x) c("Neuron", "Glia", "Other")[which.max(x)]
+)
+```
+### visualize
+```{r}
+# Make a table of cell type per cluster
+cell_type_cluster <- table(lSeq$seurat_clusters, lSeq$cell_type)
+
+# Convert to data frame
+df <- as.data.frame(cell_type_cluster)
+colnames(df) <- c("Cluster", "CellType", "Count")
+
+# Bar plot: side-by-side
+ggplot(df, aes(x = Cluster, y = Count, fill = CellType)) +
+  geom_bar(stat = "identity", position = "dodge") +
+  ylab("Cell Count") +
+  xlab("Seurat Cluster") +
+  theme_minimal() +
+  ggtitle("Cell Type Counts per Cluster") #+
+ #theme(axis.text.x = element_text(angle = 45, hjust = 1))
+
+#ggsave("lSeqMod.pdf", width = 12, height = 8, dpi = 300)
+```
+
+### Assign labels by cluster
+```{r}
+cluster_labels <- lSeq@meta.data %>%
+  group_by(seurat_clusters, cell_type) %>%
+  summarise(n = n(), .groups = "drop") %>%
+  group_by(seurat_clusters) %>%
+  slice_max(n, n = 1, with_ties = FALSE) %>%
+  ungroup() %>%
+  mutate(seurat_clusters = as.numeric(seurat_clusters)) %>%  # now safely convert to numeric
+  arrange(seurat_clusters)  # sort numerically
+
+#print(cluster_labels)
+```
+
+```{r}
+Idents(lSeq) <- lSeq$seurat_clusters
+```
+
+```{r}
+new.cluster.ids <- cluster_labels$cell_type
+names(new.cluster.ids) <- levels(lSeq)
+lSeq <- RenameIdents(lSeq, new.cluster.ids)
+lSeq$broadcelltypes <- Idents(lSeq)
+```
+
+```{r}
+# sanity check
+table(lSeq$seurat_clusters, lSeq$broadcelltypes)
+```
+
+### plot to check
+
+```{r}
+DimPlot(lSeq, reduction = "umap", group.by = "seurat_clusters", label = TRUE)
+```
+```{r}
+DimPlot(lSeq, reduction = "umap", group.by = "broadcelltypes", label = TRUE)
+```
+
+## Refine annotations with DEGs
+### Calculate degs
+```{r}
+pb <- AggregateExpression(
+  lSeq,
+  assays        = "RNA",
+  group.by      = c("population", "sample_id", "seurat_clusters"),
+  return.seurat = TRUE
+)
+
+cts <- GetAssayData(pb, assay = "RNA", layer = "counts")
+
+coldata <- pb@meta.data %>%
+  tibble::rownames_to_column("col_id") %>%     # rownames are the pseudo-bulk column IDs
+  transmute(
+    col_id     = col_id,
+    sample     = sample_id,
+    Population = factor(population, levels = c("surface", "cave")),
+    CellType   = seurat_clusters
+  )
+```
+all clusters
+```{r}
+res <- run_all_celltype_deg_exports(
+  cts = cts,
+  coldata = coldata,
+  padj_cut = 0.05,
+  lfc_min = 0.5,
+  positive_only = TRUE,
+  out_csv = "WBseurat_clusters_MarkerDEGs.csv"
+)
+```
+single cluster
+```{r}
+res <- deseq2_pb_annotation(
+  cts              = cts,     # pseudobulk count matrix (genes x columns)
+  coldata          = coldata,     # pseudobulk metadata
+  target_celltype  = "0"
+)
+
+format_and_write_annotation_csv(
+  res_df = res$res_all,
+  neuro_cluster_label = "WB0",
+  padj_cut = 0.05,
+  top_n = 500
+)
+```
+
+### Refine annotations by cluster
+```{r}
+rm(non_cells)
+# Get cluster cells
+non_cells <- WhichCells(lSeq, idents = c("47"))
+
+## Reassign identities
+current_idents <- Idents(lSeq)
+current_idents[non_cells] <- "Glia"
+Idents(lSeq) <- current_idents
+lSeq$finalbroadcelltypes <- Idents(lSeq) 
+```
+
+Check cluster on UMAP
+```{r}
+Idents(lSeq) <- lSeq$seurat_clusters
+
+cluster_to_highlight <- "35"
+
+DimPlot(lSeq,
+  group.by = "seurat_clusters",
+  cols = c("grey80", "red"),
+  cells.highlight = WhichCells(lSeq, idents = 35),
+  label = FALSE
+) +
+  ggtitle(paste("Highlighted cluster", cluster_to_highlight)) + NoLegend()
+
+#chang idents back to avoid confusion
+Idents(lSeq) <- lSeq$finalbroadcelltypes
+```
+## Refine annotations by subclustering original clusters
+### subset data
+```{r}
+Idents(lSeq) <- lSeq$seurat_clusters
+lSeqSub <- subset(x = lSeq, idents = c("20"))
+Idents(lSeq) <- lSeq$finalbroadcelltypes
+```
+
+### reprocess subset
+```{r}
+lSeqSub <- FindNeighbors(lSeqSub, dims = 1:20, reduction = "pca")
+lSeqSub <- FindClusters(lSeqSub, resolution =c(0.25, 0.5, 0.75))
+```
+
+### determine resolution
+```{r}
+#clustering tree
+clustree(lSeqSub@meta.data, prefix = "RNA_snn_res.0", exprs = "data", node_colour = "sc3_stability",  
+         node_text_colour = "white",show_axis=TRUE) + theme(legend.position = "bottom")
+```
+
+```{r}
+#choose resolution according to clustree
+Idents(lSeqSub) <- lSeqSub@meta.data[["RNA_snn_res.0.75"]]
+lSeqSub <- RunUMAP(lSeqSub, dims = 1:20, reduction = "pca")
+```
+
+### Module scoring by subset cluster
+```{r}
+# default bin size is 24 - sometimes too large for smaller subclusters
+binnum = 20
+
+lSeqSub <- AddModuleScore(lSeqSub, features = list(neuronal_markers), name = "NeuronScore", nbin = binnum)
+lSeqSub <- AddModuleScore(lSeqSub, features = list(glial_markers), name = "GliaScore", nbin = binnum)
+lSeqSub <- AddModuleScore(lSeqSub, features = list(other_markers), name = "OtherScore", nbin = binnum)
+
+# Classify by max score
+lSeqSub$cell_type <- apply(
+  lSeqSub@meta.data[, c("NeuronScore1", "GliaScore1", "OtherScore1")],
+  1,
+  function(x) c("Neuron", "Glia", "Other")[which.max(x)]
+)
+```
+
+```{r}
+# Make a table of cell type per cluster
+cell_type_cluster <- table(lSeqSub$seurat_clusters, lSeqSub$cell_type)
+
+# Convert to data frame
+df <- as.data.frame(cell_type_cluster)
+colnames(df) <- c("Cluster", "CellType", "Count")
+
+# Bar plot: side-by-side
+ggplot(df, aes(x = Cluster, y = Count, fill = CellType)) +
+  geom_bar(stat = "identity", position = "dodge") +
+  ylab("Cell Count") +
+  xlab("Seurat Cluster") +
+  theme_minimal() +
+  ggtitle("Cell Type Counts per Cluster") 
+ # theme(axis.text.x = element_text(angle = 45, hjust = 1))
+```
+
+
+
+### Marker genes by subset 
+### UMAP distribution
+```{r}
+#DimPlot acording to cluster identity
+DimPlot(object = (lSeqSub),label=TRUE,  pt.size = 0.5) +
+  theme(axis.title.x=element_text(size=12),
+        axis.title.y=element_text(size=12))
+```
+### Subcluster DEGs
+#### sample level
+```{r}
+pb <- AggregateExpression(
+  lSeqSub,
+  assays        = "RNA",
+  group.by      = c("population", "sample_id", "seurat_clusters"),
+  return.seurat = TRUE
+)
+
+cts <- GetAssayData(pb, assay = "RNA", layer = "counts")
+
+coldata <- pb@meta.data %>%
+  tibble::rownames_to_column("col_id") %>%     # rownames are the pseudo-bulk column IDs
+  transmute(
+    col_id     = col_id,
+    sample     = sample_id,
+    Population = factor(population, levels = c("surface", "cave")),
+    CellType   = seurat_clusters
+  )
+```
+all clusters
+```{r}
+res <- run_all_celltype_deg_exports(
+  cts = cts,
+  coldata = coldata,
+  padj_cut = 0.05,
+  lfc_min = 0.5,
+  positive_only = TRUE,
+  out_csv = "Subcluster_MarkerDEGs.csv"
+)
+```
+
+
+### re-assign idents by subcluster
+```{r}
+rm(non_cells)
+# Get cell names in cluster x of subcluster
+non_cells <- WhichCells(lSeqSub, idents = c("7"))
+
+# make sure subset cell names match the full object
+non_cells <- intersect(non_cells, colnames(lSeq))
+
+# Reassign identities
+current_idents <- Idents(lSeq)
+current_idents[non_cells] <- "Glia"
+Idents(lSeq) <- current_idents
+```
+## Check annotations against original cluster
+```{r}
+
+lSeq$finalbroadcelltypes <- Idents(lSeq)
+
+# Get a table of cluster vs cell_type
+tab <-table(lSeq$seurat_clusters,lSeq$finalbroadcelltypes)
+tab
+```
+# . Whole brain analysis using major cell type group annotations
+## UMAP figures
+### All initial clusters
+```{r}
+p_final <- mini_axis_umap(
+  lSeq,
+  reduction = "umap",
+  group.by = "seurat_clusters",
+  label = TRUE,
+  shuffle = TRUE,
+  alpha = 0.8,
+  pt.size = 0.5,
+  axis_frac = 0.08,
+  pad_frac  = 0.03
+)
+
+p_final
+#ggsave("lSeqUmapNoCoords.pdf", p_final, width = 10, height = 8, dpi = 300)
+```
+
+### Major cell type groups
+```{r}
+#DimPlot acording to cluster identity
+DimPlot(object = (lSeq), label=TRUE,  pt.size = 0.5,
+         cols = c("goldenrod2","slateblue2", "lightcoral")) +
+  theme(axis.title.x=element_text(size=12),
+        axis.title.y=element_text(size=12))
+
+#ggsave("WB.pdf", width = 10, height = 8, dpi = 300)
+```
+
+#### Dot plot
+```{r}
+DotPlot(lSeq, features = c(
+  
+ # Neuron
+  "elavl3", "elavl4", "kcnc3a", "cacna1aa","rbfox3a", "snap25a",
+  
+  
+ # Glia
+ "msi1b", "qki2", "fabp7a", "glula", "slc1a2b", "kcnj10a", 
+  
+ # Other  
+  "slc38a5b", "sparc", "ahnak", "mcamb","col1a1a","col1a2"
+ 
+    )
+) + coord_flip() + 
+  scale_color_gradient(
+    low = "floralwhite",
+    high = "#4d0099",
+    oob = scales::squish,
+    limits = c(0,1),
+    name = "avg.exp"
+  ) +
+  theme_bw(base_size = 12) 
+
+#ggsave("lSeqMarksDot.pdf", dpi = 300)
+```
+
+#### Other
+```{r}
+FeaturePlot(lSeq, features = c("slc38a5b", "sparc", "ahnak"),  max.cutoff = 3, cols = c("grey",
+    "lightcoral"), reduction = "umap", pt.size = 0.5)
+
+#ggsave("featureOther.pdf", width = 10, height = 8, dpi = 300)
+```
+
+#### Neuron
+```{r}
+FeaturePlot(lSeq, features = c("elavl4", "kcnc3a", "cacna1aa"),  max.cutoff = 3, cols = c("grey",
+    "goldenrod2"), reduction = "umap", pt.size = 0.5)
+
+#ggsave("featureNeuron.pdf", width = 10, height = 8, dpi = 300)
+```
+#### Glia
+```{r}
+FeaturePlot(lSeq, features = c("msi1b", "qki2", "ptn"),  max.cutoff = 3, cols = c("grey",
+    "slateblue2"), reduction = "umap", pt.size = 0.5)
+
+#ggsave("featureGlia.pdf", width = 10, height = 8, dpi = 300)
+```
+
+
+
+

@@ -1,0 +1,3171 @@
+---
+title: "Glia"
+output: 
+  html_notebook: 
+    toc: true
+    theme: cerulean
+    number_sections: true
+---
+
+# . Environment
+## Load libraries
+```{r}
+#RNA seq specific
+library(Seurat)
+library(clustree)
+library(DESeq2)
+library(harmony)
+library(MAST)
+
+#plotting
+library(ggplot2)
+library(pheatmap)
+library(ggrepel) # label volcano
+library(patchwork) # color strip
+library(forcats)
+library(eulerr)
+library(ggbreak)
+
+#data management
+library(tibble)
+library(readr)
+library(stringr)
+library(dplyr)
+```
+## Load gene annotation maps
+```{r}
+# Extract GeneID to gene_symbol from NCBI genomic.gff
+gff_lines <- readLines("genomic.gff")
+gene_lines <- grep("\tgene\t", gff_lines, value = TRUE)
+
+extract_geneid_symbol <- function(attr) {
+  id <- sub(".*Dbxref=GeneID:([0-9]+).*", "\\1", attr)
+  symbol <- sub(".*;gene=([^;]+);.*", "\\1", attr)
+  data.frame(GeneID = id, gene_symbol = symbol)
+}
+
+gff_df <- do.call(rbind, lapply(gene_lines, function(line) {
+  fields <- strsplit(line, "\t")[[1]]
+  if (length(fields) >= 9) extract_geneid_symbol(fields[9]) else NULL
+}))
+
+gff_df$GeneID <- as.character(gff_df$GeneID)
+
+
+# Combine GFF and gene2ensembl mappings
+gene_map <- gff_df %>%
+  dplyr::distinct()
+
+## create separate map for manually labeled LOC genes
+loc_map <- c(
+  "103040661" = "her4.1", #radial glia
+  "103035120" = "gfap", #astrocytes/radial glia
+  "103034161" = "mpeg1", #macrophage/microglia
+  "125803969"= "mrc1b" #macrophage/microglia
+)
+
+## update map 
+# Make sure GeneID is character to match loc_map names
+gene_map$GeneID <- as.character(gene_map$GeneID)
+
+# Replace gene_symbol where GeneID matches your manual map
+gene_map$gene_symbol <- ifelse(
+  gene_map$GeneID %in% names(loc_map),
+  loc_map[gene_map$GeneID],
+  gene_map$gene_symbol
+)
+
+# Check results
+head(gene_map)
+```
+## define functions
+### Run binomial glm for composition stats
+Note: scCoda does not work well with low n data sets so we used a 
+Binomial glm with dispersion and batch
+-Runs binomial with batch correction first, tests overdispersion vs overdisp_cut, if above threshold, uses beta-binomial for stats
+```{r}
+run_prop_glm_and_plot <- function(
+  denom_obj,
+  group_var = "idents",           # "idents" or metadata column in denom_obj
+  sample_col = "sample_id",
+  pop_col = "population",
+  batch_col = "batch",            # created from sample_id if missing
+  pop_ref = "surface",
+  pop_levels = c("surface", "cave"),
+  plot_percent = TRUE,
+  bar_error = c("sem", "sd", "none"),
+  overlay_points = TRUE,
+  point_jitter = 0.08,
+  fdr_cutoff = 0.05,
+  glm_family = c("auto", "betabinomial", "quasibinomial", "binomial"),
+  overdisp_cut = 1.2,
+  # ---- batch-driven overdispersion revert gate (AUTO only) ----
+  batch_revert = TRUE,
+  batch_revert_ratio = 0.6,       # if overdisp_with_batch <= ratio * overdisp_no_batch -> "mostly batch"
+  batch_revert_p = 0.05,          # batch must be supported by binomial LRT
+  batch_revert_overdisp_max = 1.5,# and residual overdisp w/ batch must be modest
+  order_levels = NULL,
+  strict_sum_to_one = TRUE
+) {
+  bar_error  <- match.arg(bar_error)
+  glm_family <- match.arg(glm_family)
+
+  suppressPackageStartupMessages({
+    library(Seurat)
+    library(dplyr)
+    library(tidyr)
+    library(ggplot2)
+    library(purrr)
+    library(broom)
+  })
+
+  md <- as.data.frame(denom_obj@meta.data)
+
+  if (!all(c(sample_col, pop_col) %in% colnames(md))) {
+    stop("Metadata must contain: ", paste(c(sample_col, pop_col), collapse = ", "))
+  }
+
+  # unwrap list columns (defensive)
+  for (v in c(sample_col, pop_col)) {
+    if (is.list(md[[v]])) md[[v]] <- vapply(md[[v]], \(x) as.character(x)[1], character(1))
+  }
+  if (!identical(group_var, "idents") && group_var %in% colnames(md) && is.list(md[[group_var]])) {
+    md[[group_var]] <- vapply(md[[group_var]], \(x) as.character(x)[1], character(1))
+  }
+
+  # factorize sample + population
+  md[[sample_col]] <- factor(md[[sample_col]])
+  md[[pop_col]]    <- stats::relevel(factor(md[[pop_col]], levels = pop_levels), ref = pop_ref)
+
+  # ============================================================
+  # Batch: derive from sample_id (underscore => batch2; else batch1)
+  # ============================================================
+  smp_chr <- as.character(md[[sample_col]])
+  md[[batch_col]] <- ifelse(grepl("_", smp_chr), "batch2", "batch1")
+  md[[batch_col]] <- factor(md[[batch_col]], levels = c("batch1", "batch2"))
+
+  # group labels from THIS SAME OBJECT
+  if (identical(group_var, "idents")) {
+    grp <- as.character(Idents(denom_obj))
+    default_levels <- levels(Idents(denom_obj))
+  } else {
+    if (!group_var %in% colnames(md)) stop("group_var not found in metadata: ", group_var)
+    grp <- as.character(md[[group_var]])
+    default_levels <- if (is.factor(md[[group_var]])) levels(md[[group_var]]) else unique(grp)
+  }
+
+  # enforce complete labeling (no silent dropping)
+  if (any(is.na(grp) | grp == "")) {
+    bad_n <- sum(is.na(grp) | grp == "")
+    stop(
+      "Found ", bad_n, " cells with NA/blank group labels in ", group_var, ".\n",
+      "Fix labels so proportions are well-defined."
+    )
+  }
+
+  md$.__group <- as.character(grp)
+
+  # determine plotting order
+  keep_levels <- if (!is.null(order_levels)) as.character(order_levels) else as.character(default_levels)
+  present <- unique(md$.__group)
+  if (!all(present %in% keep_levels)) keep_levels <- c(keep_levels, setdiff(present, keep_levels))
+  keep_levels <- keep_levels[keep_levels != "" & !is.na(keep_levels)]
+  md$.__group <- factor(md$.__group, levels = keep_levels)
+
+  # ============================================================
+  # 1) Per-sample counts and proportions
+  # ============================================================
+  totals <- md %>%
+    dplyr::group_by(.data[[sample_col]], .data[[pop_col]], .data[[batch_col]]) %>%
+    dplyr::summarise(total = dplyr::n(), .groups = "drop")
+
+  counts <- md %>%
+    dplyr::group_by(.data[[sample_col]], .data[[pop_col]], .data[[batch_col]], .__group) %>%
+    dplyr::summarise(count = dplyr::n(), .groups = "drop")
+
+  props_by_sample <- totals %>%
+    tidyr::expand_grid(.__group = factor(keep_levels, levels = keep_levels)) %>%
+    dplyr::left_join(counts, by = c(sample_col, pop_col, batch_col, ".__group")) %>%
+    dplyr::mutate(
+      count = ifelse(is.na(count), 0L, count),
+      non   = total - count,
+      prop  = count / total
+    )
+
+  if (any(props_by_sample$non < 0, na.rm = TRUE)) {
+    stop("Some group counts exceeded totals (should not happen with one input object).")
+  }
+
+  qc_sumprop <- props_by_sample %>%
+    dplyr::group_by(.data[[sample_col]], .data[[pop_col]], .data[[batch_col]]) %>%
+    dplyr::summarise(sum_prop = sum(prop), .groups = "drop")
+
+  if (isTRUE(strict_sum_to_one)) {
+    if (any(abs(qc_sumprop$sum_prop - 1) > 1e-6)) {
+      print(qc_sumprop)
+      stop(
+        "Proportions do not sum to 1 within at least one (sample, population, batch).\n",
+        "This indicates grouping does not partition all cells in the object."
+      )
+    }
+  }
+
+  # ============================================================
+  # 2) Bars + error bars across samples
+  # ============================================================
+  bar_df <- props_by_sample %>%
+    dplyr::group_by(.__group, .data[[pop_col]]) %>%
+    dplyr::summarise(
+      mean_prop = mean(prop, na.rm = TRUE),
+      sd_prop   = sd(prop, na.rm = TRUE),
+      n_samp    = dplyr::n(),
+      se_prop   = sd_prop / sqrt(n_samp),
+      .groups = "drop"
+    ) %>%
+    dplyr::mutate(
+      Var1 = factor(as.character(.__group), levels = keep_levels),
+      Var2 = factor(as.character(.data[[pop_col]]), levels = pop_levels)
+    )
+
+  cellprops <- bar_df %>% dplyr::transmute(Var1, Var2, Freq = mean_prop)
+
+  # ============================================================
+  # 3) Effects per group (population cave vs surface)
+  # ============================================================
+  pop_term <- paste0(pop_col, pop_levels[2])  # e.g. "populationcave"
+
+  # Robust beta-binomial fitter (tries multiple glmmTMBControl settings)
+  fit_bb_robust <- function(form, data) {
+    if (!requireNamespace("glmmTMB", quietly = TRUE)) {
+      stop("glm_family includes betabinomial but 'glmmTMB' is not installed.")
+    }
+
+    ctrl_list <- list(
+      glmmTMB::glmmTMBControl(),
+      glmmTMB::glmmTMBControl(
+        optimizer = stats::nlminb,
+        optCtrl = list(iter.max = 100000, eval.max = 100000)
+      ),
+      glmmTMB::glmmTMBControl(
+        optimizer = stats::optim,
+        optArgs = list(method = "BFGS"),
+        optCtrl = list(maxit = 100000)
+      )
+    )
+
+    fits <- vector("list", length(ctrl_list))
+    diags <- vector("list", length(ctrl_list))
+
+    for (i in seq_along(ctrl_list)) {
+      warn_msgs <- character(0)
+
+      fit_i <- tryCatch(
+        withCallingHandlers(
+          glmmTMB::glmmTMB(
+            form,
+            family = glmmTMB::betabinomial(link = "logit"),
+            data = data,
+            control = ctrl_list[[i]]
+          ),
+          warning = function(w) {
+            warn_msgs <<- c(warn_msgs, conditionMessage(w))
+            invokeRestart("muffleWarning")
+          }
+        ),
+        error = function(e) NULL
+      )
+
+      if (is.null(fit_i)) {
+        fits[[i]] <- NULL
+        diags[[i]] <- list(ok = FALSE, warn = "ERROR", conv = NA_integer_, pdHess = NA, aic = Inf)
+        next
+      }
+
+      conv_code <- tryCatch(fit_i$fit$convergence, error = function(e) NA_integer_)
+      pdHess    <- tryCatch(isTRUE(fit_i$sdr$pdHess), error = function(e) NA)
+      aic_val   <- tryCatch(stats::AIC(fit_i), error = function(e) Inf)
+
+      ok <- isTRUE(pdHess) && (!is.na(conv_code) && conv_code == 0)
+
+      fits[[i]] <- fit_i
+      diags[[i]] <- list(
+        ok = ok,
+        warn = if (length(warn_msgs) > 0) paste(unique(warn_msgs), collapse = " | ") else NA_character_,
+        conv = conv_code,
+        pdHess = pdHess,
+        aic = aic_val
+      )
+
+      if (ok) return(list(fit = fit_i, diag = diags[[i]]))
+    }
+
+    aic_vec <- vapply(diags, function(d) {
+      if (is.null(d) || is.null(d$aic) || !is.finite(d$aic)) Inf else d$aic
+    }, numeric(1))
+
+    if (all(is.infinite(aic_vec)) || all(vapply(fits, is.null, logical(1)))) {
+      return(list(
+        fit = NULL,
+        diag = list(ok = FALSE, warn = "ALL_FITS_FAILED", conv = NA_integer_, pdHess = NA, aic = Inf)
+      ))
+    }
+
+    best_i <- which.min(aic_vec)
+    list(fit = fits[[best_i]], diag = diags[[best_i]])
+  }
+
+  fit_and_tidy_one <- function(df_sub) {
+    form_full <- stats::as.formula(paste0("cbind(count, non) ~ ", pop_col, " + ", batch_col))
+
+    # ---- Always fit binomial baseline (for overdisp diagnostic + binomial output) ----
+    m_bin <- stats::glm(form_full, family = stats::binomial(), data = df_sub)
+    overdisp_bin <- m_bin$deviance / m_bin$df.residual
+
+    tidy_bin <- broom::tidy(m_bin) %>%
+      dplyr::filter(term == pop_term) %>%
+      dplyr::transmute(
+        term, estimate, std.error, statistic, p.value,
+        dispersion = 1,
+        overdisp   = overdisp_bin,
+        model_used = "binomial"
+      )
+
+    if (nrow(tidy_bin) == 0) {
+      tidy_bin <- dplyr::tibble(
+        term = pop_term, estimate = NA_real_, std.error = NA_real_,
+        statistic = NA_real_, p.value = NA_real_,
+        dispersion = 1, overdisp = overdisp_bin,
+        model_used = "binomial"
+      )
+    }
+
+    # If binomial explicitly requested -> return it
+    if (glm_family == "binomial") return(tidy_bin)
+
+    # Quasi helper (used for explicit quasi or auto fallback)
+    fit_quasi_row <- function(label = "quasibinomial") {
+      m_q <- stats::glm(form_full, family = stats::quasibinomial(), data = df_sub)
+      disp_q <- summary(m_q)$dispersion
+      over_q <- m_q$deviance / m_q$df.residual
+
+      td <- broom::tidy(m_q)
+      out <- td %>%
+        dplyr::filter(term == pop_term) %>%
+        dplyr::transmute(
+          term, estimate, std.error, statistic, p.value,
+          dispersion = disp_q,
+          overdisp   = over_q,
+          model_used = label
+        )
+
+      if (nrow(out) == 0) {
+        out <- dplyr::tibble(
+          term = pop_term, estimate = NA_real_, std.error = NA_real_,
+          statistic = NA_real_, p.value = NA_real_,
+          dispersion = disp_q, overdisp = over_q,
+          model_used = label
+        )
+      }
+      out
+    }
+
+    if (glm_family == "quasibinomial") return(fit_quasi_row("quasibinomial"))
+
+    # ============================================================
+    # AUTO-only "batch explains overdispersion" revert-to-binomial
+    # ============================================================
+    if (glm_family == "auto" && isTRUE(batch_revert)) {
+      form_nobatch <- stats::as.formula(paste0("cbind(count, non) ~ ", pop_col))
+      m_nobatch <- stats::glm(form_nobatch, family = stats::binomial(), data = df_sub)
+      overdisp_nobatch <- m_nobatch$deviance / m_nobatch$df.residual
+
+      lrt_b <- stats::anova(m_nobatch, m_bin, test = "Chisq")
+      p_batch <- NA_real_
+      pcol <- intersect(colnames(lrt_b), c("Pr(>Chi)", "Pr(>Chisq)"))
+      if (length(pcol) > 0) p_batch <- unname(lrt_b[[pcol[1]]][2])
+
+      ratio <- overdisp_bin / overdisp_nobatch
+
+      if (is.finite(overdisp_nobatch) && is.finite(overdisp_bin) && is.finite(ratio) &&
+          (overdisp_nobatch > overdisp_cut) &&
+          (ratio <= batch_revert_ratio) &&
+          (!is.na(p_batch) && p_batch < batch_revert_p) &&
+          (overdisp_bin <= batch_revert_overdisp_max)) {
+        tidy_bin$model_used <- "binomial_batch_explains"
+        return(tidy_bin)
+      }
+    }
+
+    # AUTO: if not meaningfully overdispersed, stick with binomial
+    if (glm_family == "auto" && is.finite(overdisp_bin) && overdisp_bin <= overdisp_cut) {
+      return(tidy_bin)
+    }
+
+    # From here: we want beta-binomial (explicit or auto when overdispersed)
+    if (!requireNamespace("glmmTMB", quietly = TRUE)) {
+      if (glm_family == "auto") return(fit_quasi_row("quasi_fallback"))
+      stop("glm_family='betabinomial' requires 'glmmTMB'. Install it with install.packages('glmmTMB').")
+    }
+
+    bb_full <- fit_bb_robust(form_full, df_sub)
+    m_full  <- bb_full$fit
+    d_full  <- bb_full$diag
+
+    # If beta cannot be fit, AUTO falls back to quasi; explicit beta returns NAs
+    if (is.null(m_full)) {
+      if (glm_family == "auto") {
+        out <- fit_quasi_row("quasi_fallback")
+        out$bb_conv   <- d_full$conv
+        out$bb_pdHess <- d_full$pdHess
+        out$bb_warn   <- d_full$warn
+        return(out)
+      }
+      return(dplyr::tibble(
+        term = pop_term, estimate = NA_real_, std.error = NA_real_,
+        statistic = NA_real_, p.value = NA_real_,
+        dispersion = NA_real_, overdisp = overdisp_bin,
+        model_used = "betabinomial_failed",
+        bb_conv = d_full$conv, bb_pdHess = d_full$pdHess, bb_warn = d_full$warn
+      ))
+    }
+
+    # ============================================================
+    # WALD inference for beta-binomial (matches binomial reporting)
+    # ============================================================
+    co <- summary(m_full)$coefficients$cond
+    co_pop <- co[rownames(co) == pop_term, , drop = FALSE]
+
+    est <- if (nrow(co_pop) == 1) unname(co_pop[1, "Estimate"]) else NA_real_
+    se  <- if (nrow(co_pop) == 1) unname(co_pop[1, "Std. Error"]) else NA_real_
+    z   <- if (nrow(co_pop) == 1 && "z value" %in% colnames(co_pop)) unname(co_pop[1, "z value"]) else NA_real_
+    p_w <- if (nrow(co_pop) == 1 && "Pr(>|z|)" %in% colnames(co_pop)) unname(co_pop[1, "Pr(>|z|)"]) else NA_real_
+
+    bb_sigma <- tryCatch(unname(stats::sigma(m_full)), error = function(e) NA_real_)
+
+    out <- dplyr::tibble(
+      term       = pop_term,
+      estimate   = est,
+      std.error  = se,
+      statistic  = z,
+      p.value    = p_w,
+      dispersion = bb_sigma,
+      overdisp   = overdisp_bin,
+      model_used = "betabinomial",
+      bb_conv    = d_full$conv,
+      bb_pdHess  = d_full$pdHess,
+      bb_warn    = d_full$warn
+    )
+
+    # Some fits can return NA Wald SE/p even if pdHess TRUE; AUTO falls back to quasi.
+    if (glm_family == "auto" && (!is.finite(out$std.error) || !is.finite(out$p.value))) {
+      qout <- fit_quasi_row("quasi_fallback")
+      qout$bb_conv   <- d_full$conv
+      qout$bb_pdHess <- d_full$pdHess
+      qout$bb_warn   <- d_full$warn
+      return(qout)
+    }
+
+    out
+  }
+
+  glm_effects <- props_by_sample %>%
+    dplyr::group_by(.__group) %>%
+    tidyr::nest() %>%
+    dplyr::mutate(tidy = purrr::map(data, fit_and_tidy_one)) %>%
+    dplyr::select(.__group, tidy) %>%
+    tidyr::unnest(tidy) %>%
+    {
+      if (!"bb_conv" %in% names(.)) {
+        .$bb_conv   <- NA_integer_
+        .$bb_pdHess <- NA
+        .$bb_warn   <- NA_character_
+      }
+      if (!"model_used" %in% names(.)) {
+        .$model_used <- NA_character_
+      }
+      .
+    } %>%
+    dplyr::mutate(
+      odds_ratio = exp(estimate),
+      p_adj = stats::p.adjust(p.value, "fdr"),
+      sig = ifelse(p_adj < fdr_cutoff, paste0("FDR < ", fdr_cutoff), "NS")
+    ) %>%
+    dplyr::transmute(
+      group = as.character(.__group),
+      term, estimate, std.error, statistic, p.value,
+      dispersion, overdisp,
+      p_adj, odds_ratio, sig,
+      model_used,
+      bb_conv, bb_pdHess, bb_warn
+    ) %>%
+    dplyr::arrange(p.value)
+
+  # ============================================================
+  # 4) Plot: bars + error bars + optional sample points
+  # ============================================================
+  ymult <- if (plot_percent) 100 else 1
+  ylab  <- if (plot_percent) "Percentage composition" else "Proportion composition"
+
+  p <- ggplot(cellprops, aes(fill = Var2, y = Freq * ymult, x = Var1)) +
+    geom_bar(position = position_dodge(width = 0.9), stat = "identity") +
+    theme_minimal() +
+    labs(x = "Cell type", y = ylab, fill = "population") +
+    scale_fill_manual(values = c("darkseagreen3", "palevioletred"))
+
+  if (bar_error != "none") {
+    p <- p +
+      geom_errorbar(
+        data = bar_df,
+        aes(
+          x = Var1,
+          ymin = (mean_prop - if (bar_error == "sem") se_prop else sd_prop) * ymult,
+          ymax = (mean_prop + if (bar_error == "sem") se_prop else sd_prop) * ymult,
+          group = Var2
+        ),
+        inherit.aes = FALSE,
+        color = "black",
+        linewidth = 0.4,
+        width = 0.25,
+        position = position_dodge(width = 0.9)
+      )
+  }
+
+  if (isTRUE(overlay_points)) {
+    p <- p +
+      geom_point(
+        data = props_by_sample %>%
+          dplyr::mutate(
+            Var1 = factor(as.character(.__group), levels = keep_levels),
+            Var2 = factor(as.character(.data[[pop_col]]), levels = pop_levels)
+          ),
+        aes(x = Var1, y = prop * ymult, fill = Var2),
+        inherit.aes = FALSE,
+        shape = 21,
+        color = "black",
+        size = 2,
+        alpha = 0.8,
+        position = position_jitterdodge(
+          jitter.width = point_jitter,
+          dodge.width  = 0.9
+        )
+      )
+  }
+
+  list(
+    plot_bar = p,
+    glm_effects = glm_effects,
+    props_by_sample = props_by_sample,
+    cellprops = cellprops,
+    bar_df = bar_df,
+    qc_sumprop = qc_sumprop,
+    glm_family = glm_family,
+    overdisp_cut = overdisp_cut
+  )
+}
+```
+
+### Pseudobulk DEGs 
+#### Annotation - DEGs across cell types
+```{r}
+deseq2_pb_annotation <- function(
+  cts,
+  coldata,
+  target_celltype,
+  ref_celltypes = NULL,
+  fdr_explore = 0.20,
+  min_total_count = 10,
+  min_samples = 2
+) {
+
+  stopifnot(is.matrix(cts) || inherits(cts, "dgCMatrix"))
+  stopifnot(all(c("col_id","sample","Population","CellType") %in% colnames(coldata)))
+
+  # clean coldata
+  coldata <- as.data.frame(coldata, stringsAsFactors = FALSE)
+  coldata$col_id     <- as.character(coldata$col_id)
+  coldata$sample     <- as.character(coldata$sample)
+  coldata$Population <- as.character(coldata$Population)
+  coldata$CellType   <- as.character(coldata$CellType)
+
+  # USE BOTH POPULATIONS for annotation (no subsetting)
+  cd <- coldata
+  if (nrow(cd) == 0) stop("coldata is empty after cleaning.")
+
+  # optionally restrict which “other” celltypes are allowed
+  if (!is.null(ref_celltypes)) {
+    keep_cts <- unique(c(ref_celltypes, target_celltype))
+    cd <- cd[cd$CellType %in% keep_cts, , drop = FALSE]
+    if (nrow(cd) == 0) stop("After ref_celltypes filtering, nothing left.")
+  }
+
+  # need at least some target samples
+  if (!any(cd$CellType == target_celltype)) {
+    stop("No pseudobulk columns for target celltype: ", target_celltype)
+  }
+
+  # align counts to cd
+  stopifnot(all(cd$col_id %in% colnames(cts)))
+  cts2 <- cts[, cd$col_id, drop = FALSE]
+
+  # define target vs other
+  cd$is_target <- ifelse(cd$CellType == target_celltype, "target", "other")
+  cd$is_target <- factor(cd$is_target, levels = c("other","target"))
+
+  # Prefilter genes: expressed in at least min_samples pseudobulk columns at >= min_total_count
+  keep <- Matrix::rowSums(cts2 >= min_total_count) >= min_samples
+  cts2 <- cts2[keep, , drop = FALSE]
+  if (nrow(cts2) == 0) stop("All genes filtered out; relax thresholds.")
+
+  # DESeq2 colData must match column order
+  cd2 <- cd[match(colnames(cts2), cd$col_id), , drop = FALSE]
+  stopifnot(identical(colnames(cts2), cd2$col_id))
+  rownames(cd2) <- cd2$col_id
+
+  # IMPORTANT: sample as a blocking factor (paired within sample)
+  cd2$sample    <- factor(cd2$sample)
+  cd2$is_target <- factor(cd2$is_target, levels = c("other","target"))
+
+  dds <- DESeq2::DESeqDataSetFromMatrix(
+    countData = round(cts2),
+    colData   = cd2,
+    design    = ~ sample + is_target
+  )
+
+  # sanity: need both target and other
+  if (length(unique(cd2$is_target)) < 2) {
+    stop("Need both target and other columns after filtering.")
+  }
+
+  dds <- DESeq2::DESeq(dds)
+
+  # results for target vs other
+  res <- DESeq2::results(
+    dds,
+    contrast = c("is_target","target","other"),
+    alpha = fdr_explore
+  ) |>
+    as.data.frame() |>
+    tibble::rownames_to_column("gene")
+
+  res_all <- res |>
+    dplyr::arrange(padj, dplyr::desc(baseMean))
+
+  res_sig <- res_all |>
+    dplyr::filter(!is.na(padj), padj < fdr_explore)
+
+  list(
+    dds             = dds,
+    res_sig         = res_sig,
+    res_all         = res_all,
+    target_celltype = target_celltype,
+    fdr_explore     = fdr_explore
+  )
+}
+```
+##### Export single cell type significant DEGs to csv
+```{r}
+format_and_write_annotation_csv <- function(
+  res_df,
+  neuro_cluster_label,          # e.g. "e2_tectum"
+  padj_cut = 0.05,
+  lfc_abs_min = 0,
+  top_n = 100,
+  drop_LOC = TRUE,
+  loc_regex = "^LOC",
+  extra_drop_regex = NULL
+) {
+
+  stopifnot(all(c("gene","padj","baseMean") %in% colnames(res_df)))
+
+  df <- res_df
+
+  # Optional filtering of LOC / unwanted symbols
+  if (drop_LOC) {
+    df <- df %>% filter(!grepl(loc_regex, gene))
+  }
+  if (!is.null(extra_drop_regex)) {
+    df <- df %>% filter(!grepl(extra_drop_regex, gene))
+  }
+
+  # Keep significant genes
+  df <- df %>% filter(!is.na(padj), padj <= padj_cut)
+
+  # Determine which LFC column to use
+  lfc_col <- if ("log2FoldChange_shrunk" %in% colnames(df)) {
+    "log2FoldChange_shrunk"
+  } else if ("log2FoldChange" %in% colnames(df)) {
+    "log2FoldChange"
+  } else {
+    stop("res_df must contain log2FoldChange or log2FoldChange_shrunk")
+  }
+
+  # Keep only TARGET-ENRICHED genes
+  df <- df %>% filter(.data[[lfc_col]] > 0)
+
+  # Optional LFC threshold
+  if (lfc_abs_min > 0) {
+    df <- df %>% filter(abs(.data[[lfc_col]]) >= lfc_abs_min)
+  }
+
+  # Add direction column (useful for sanity checks)
+  df <- df %>%
+    mutate(direction = "Up in target")
+
+  # Rank by: significance → specificity → expression
+  df_out <- df %>%
+    arrange(padj, desc(abs(.data[[lfc_col]])), desc(baseMean)) %>%
+    slice_head(n = top_n)
+
+  # Column order (clean CSV)
+  preferred <- c("gene","baseMean",lfc_col,"padj","pvalue","stat","lfcSE","direction")
+  keep_cols <- c(preferred, setdiff(colnames(df_out), preferred))
+  df_out <- df_out %>% select(any_of(keep_cols))
+
+  # Write directly to WORKING DIRECTORY
+  fname <- paste0(neuro_cluster_label, ".csv")
+  readr::write_csv(df_out, fname)
+
+  message("Wrote annotation DEG CSV to: ", normalizePath(fname))
+
+  return(df_out)
+}
+```
+##### Export all cell type markers with log2fold change cutoff
+```{r}
+run_all_celltype_deg_exports <- function(
+  cts,
+  coldata,
+  padj_cut = 0.05,
+  lfc_min = 1,
+  positive_only = TRUE,
+  out_csv = "AllCellTypes_DEGs_filtered.csv",
+  verbose = TRUE
+) {
+  suppressPackageStartupMessages({
+    library(dplyr)
+    library(readr)
+  })
+
+  stopifnot(is.matrix(cts) || inherits(cts, "dgCMatrix"))
+  stopifnot(all(c("col_id","sample","Population","CellType") %in% colnames(coldata)))
+
+  cd <- as.data.frame(coldata, stringsAsFactors = FALSE)
+  celltypes <- sort(unique(cd$CellType))
+  celltypes <- celltypes[!is.na(celltypes) & celltypes != ""]
+
+  if (length(celltypes) == 0) stop("No celltypes found in coldata.")
+
+  results_list <- vector("list", length(celltypes))
+  names(results_list) <- celltypes
+
+  failures <- list()
+
+  for (ct in celltypes) {
+    if (isTRUE(verbose)) message("Running DESeq2 for: ", ct)
+
+    out <- try(
+      deseq2_pb_annotation(
+        cts = cts,
+        coldata = cd,
+        target_celltype = ct
+      ),
+      silent = TRUE
+    )
+
+    if (inherits(out, "try-error")) {
+      failures[[ct]] <- as.character(out)
+      next
+    }
+
+    df <- out$res_all %>%
+      mutate(celltype = ct) %>%
+      select(celltype, gene, padj, log2FoldChange, lfcSE, pvalue, baseMean) %>%
+      filter(!is.na(padj), padj <= padj_cut) %>%
+      filter(!is.na(log2FoldChange))
+
+    if (positive_only) {
+      df <- df %>%
+        filter(log2FoldChange >= lfc_min)
+    } else {
+      df <- df %>%
+        filter(abs(log2FoldChange) >= lfc_min)
+    }
+
+    df <- df %>%
+      arrange(celltype, desc(log2FoldChange), padj, desc(baseMean))
+
+    results_list[[ct]] <- df
+  }
+
+  combined_results <- bind_rows(results_list)
+
+  readr::write_csv(combined_results, out_csv)
+
+  if (isTRUE(verbose)) {
+    message("Wrote filtered DEG file: ", normalizePath(out_csv))
+    if (length(failures) > 0) {
+      message("Some cell types failed. Check returned $failures.")
+    }
+  }
+
+  return(list(
+    degs = combined_results,
+    failures = failures
+  ))
+}
+```
+
+#### Population - subset to cell type for surface vs cave
+##### pseudobulk with deseq2
+```{r}
+deseq2_pb_celltype <- function(cts, coldata, celltype,
+                               fdr_explore = 0.20,
+                               min_total_count = 10,
+                               min_samples = 2,
+                               shrink_type = c("apeglm", "ashr", "normal")) {
+
+  suppressPackageStartupMessages({
+    library(Matrix)
+    library(DESeq2)
+    library(dplyr)
+    library(tibble)
+  })
+
+  shrink_type <- match.arg(shrink_type)
+
+  stopifnot(is.matrix(cts) || inherits(cts, "dgCMatrix"))
+  stopifnot(all(c("col_id","sample","Population","CellType") %in% colnames(coldata)))
+
+  # Coerce to plain data.frame to avoid Rle/list columns breaking dplyr verbs
+  coldata <- as.data.frame(coldata, stringsAsFactors = FALSE)
+
+  coldata$col_id     <- as.character(coldata$col_id)
+  coldata$sample     <- as.character(coldata$sample)
+  coldata$Population <- as.character(coldata$Population)
+  coldata$CellType   <- as.character(coldata$CellType)
+
+  # Align count columns
+  stopifnot(all(coldata$col_id %in% colnames(cts)))
+  cts <- cts[, coldata$col_id, drop = FALSE]
+
+  # Subset to the requested cell type (already pseudobulked columns)
+  cd_ct <- coldata[coldata$CellType == celltype, , drop = FALSE]
+  if (nrow(cd_ct) == 0) stop("No pseudobulk samples for celltype: ", celltype)
+
+  cts_ct <- cts[, cd_ct$col_id, drop = FALSE]
+
+  # Prefilter genes
+  keep <- Matrix::rowSums(cts_ct >= min_total_count) >= min_samples
+  cts_ct <- cts_ct[keep, , drop = FALSE]
+  if (nrow(cts_ct) == 0) stop("All genes filtered out; relax thresholds.")
+
+  # Build DESeq2 colData and reorder to match columns
+  cd_ct2 <- unique(cd_ct[, c("col_id", "sample", "Population")])
+  cd_ct2 <- cd_ct2[match(colnames(cts_ct), cd_ct2$col_id), , drop = FALSE]
+  stopifnot(identical(colnames(cts_ct), cd_ct2$col_id))
+  rownames(cd_ct2) <- cd_ct2$col_id
+
+  # DESeq2
+  dds <- DESeqDataSetFromMatrix(
+    countData = round(cts_ct),
+    colData   = cd_ct2,
+    design    = ~ Population
+  )
+
+  dds$Population <- factor(dds$Population)
+  if (!("surface" %in% levels(dds$Population))) {
+    stop("Population must include 'surface'. Found: ", paste(levels(dds$Population), collapse = ", "))
+  }
+  if (length(levels(dds$Population)) != 2) {
+    stop("This function assumes exactly 2 Population levels. Found: ", paste(levels(dds$Population), collapse = ", "))
+  }
+
+  dds$Population <- relevel(dds$Population, ref = "surface")
+  dds <- DESeq(dds)
+
+  alt <- setdiff(levels(dds$Population), "surface")[1]
+  coef_name <- paste0("Population_", make.names(alt), "_vs_surface")
+  if (!coef_name %in% resultsNames(dds)) {
+    coef_name <- resultsNames(dds)[grepl("^Population_", resultsNames(dds))][1]
+  }
+
+  res <- results(dds, name = coef_name, alpha = fdr_explore) |>
+    as.data.frame() |>
+    tibble::rownames_to_column("gene")
+
+  res_shr <- tryCatch({
+    shr <- lfcShrink(dds, coef = coef_name, type = shrink_type)
+    as.data.frame(shr) |> tibble::rownames_to_column("gene")
+  }, error = function(e) {
+    shr <- lfcShrink(dds, coef = coef_name, type = "normal")
+    as.data.frame(shr) |> tibble::rownames_to_column("gene")
+  })
+
+  res_merged <- res |>
+    dplyr::left_join(
+      res_shr |> dplyr::select(gene, log2FoldChange) |> dplyr::rename(log2FoldChange_shrunk = log2FoldChange),
+      by = "gene"
+    ) |>
+    dplyr::arrange(padj, dplyr::desc(abs(log2FoldChange_shrunk)))
+
+  res_celltype <- res_merged |>
+    dplyr::filter(!is.na(padj), padj < fdr_explore)
+
+  list(
+    dds          = dds,
+    res_celltype = res_celltype,
+    res_all      = res_merged,
+    celltype     = celltype,
+    coef_name    = coef_name,
+    fdr_explore  = fdr_explore
+  )
+}
+```
+label volcano plot
+```{r}
+label_top_genes <- function(de_result,
+                            logfc_thresh = 0,
+                            padj_thresh  = 0.05,
+                            top_n_per_side = 80) {
+  df <- de_result %>%
+    mutate(
+      # significance category for plotting
+      significance = case_when(
+        !is.na(padj) & padj < padj_thresh & log2FoldChange >  logfc_thresh ~ "Up in Cave",
+        !is.na(padj) & padj < padj_thresh & log2FoldChange < -logfc_thresh ~ "Up in Surface",
+        TRUE ~ "Not significant"
+      ),
+      # robust -log10(padj): guard against 0/NA
+      logP = -log10(pmax(padj, .Machine$double.xmin)),
+
+      # annotated = not LOC######## 
+      is_annotated = !grepl("^LOC\\d+$", final_gene_symbol)
+    )
+
+  # choose which points to label: top N per side by -log10(padj), annotated only
+  lab_idx <- df %>%
+    filter(significance != "Not significant", is_annotated) %>%
+    group_by(significance) %>%
+    slice_max(order_by = logP, n = top_n_per_side, with_ties = FALSE) %>%
+    ungroup() %>%
+    mutate(to_label = TRUE) %>%
+    select(final_gene_symbol, log2FoldChange, padj, to_label)
+
+  # attach labels; no join on floats for everything—only to mark the chosen labels
+  df <- df %>%
+    left_join(lab_idx,
+              by = c("final_gene_symbol","log2FoldChange","padj")) %>%
+    mutate(
+      label = ifelse(!is.na(to_label), final_gene_symbol, NA_character_)
+    ) %>%
+    select(-to_label)
+
+  df
+}
+```
+##### MAST with FindMarkers
+```{r}
+run_celltype_DE_analysis_pop_fm <- function(
+  seurat_obj,
+  celltype_name,
+  celltype_col = "gliacelltypes",
+  pop_col = "population",
+  assay_use = "RNA",
+  layer_use = "data",
+  cave_label = "cave",
+  surface_label = "surface"
+) {
+  suppressPackageStartupMessages({
+    library(Seurat)
+    library(dplyr)
+  })
+
+
+  # Basic checks
+  if (!inherits(seurat_obj, "Seurat")) {
+    stop("seurat_obj must be a Seurat object")
+  }
+
+  md <- seurat_obj@meta.data
+
+  if (!celltype_col %in% colnames(md)) {
+    stop(sprintf("metadata column '%s' not found in seurat_obj@meta.data", celltype_col))
+  }
+
+  if (!pop_col %in% colnames(md)) {
+    stop(sprintf("metadata column '%s' not found in seurat_obj@meta.data", pop_col))
+  }
+
+  if (!layer_use %in% Layers(seurat_obj[[assay_use]])) {
+    stop(sprintf("layer '%s' not found in assay '%s'", layer_use, assay_use))
+  }
+
+ 
+  # Subset to requested cell type
+   keep_cells <- rownames(md)[
+    !is.na(md[[celltype_col]]) &
+      md[[celltype_col]] == celltype_name
+   ]
+
+  if (length(keep_cells) == 0) {
+    stop(sprintf("No cells found for cell type '%s'", celltype_name))
+  }
+
+  obj_sub <- subset(seurat_obj, cells = keep_cells)
+
+ 
+  # Confirm both populations are present
+  sub_pops <- unique(as.character(obj_sub@meta.data[[pop_col]]))
+
+  if (!all(c(cave_label, surface_label) %in% sub_pops)) {
+    stop(sprintf(
+      "Cell type '%s' does not contain both '%s' and '%s'",
+      celltype_name, cave_label, surface_label
+    ))
+  }
+
+ 
+  # Set assay and identities
+  DefaultAssay(obj_sub) <- assay_use
+  Idents(obj_sub) <- factor(obj_sub@meta.data[[pop_col]], levels = c(surface_label, cave_label))
+
+  # Set latent vars if present
+  ncount_var   <- paste0("nCount_", assay_use)
+  nfeature_var <- paste0("nFeature_", assay_use)
+
+  latent_vars_use <- c(ncount_var, nfeature_var)
+  latent_vars_use <- latent_vars_use[latent_vars_use %in% colnames(obj_sub@meta.data)]
+
+  if (length(latent_vars_use) == 0) {
+    latent_vars_use <- NULL
+  }
+
+ 
+  # Run DE
+  #    ident.1 = cave, ident.2 = surface
+  #    positive log2FC = Up in Cave
+  de_result <- FindMarkers(
+    object = obj_sub,
+    ident.1 = cave_label,
+    ident.2 = surface_label,
+    assay = assay_use,
+    slot = layer_use,
+    test.use = "MAST",
+    min.pct = 0,
+    logfc.threshold = 0,
+    only.pos = FALSE,
+    only.variable.features = FALSE,
+    latent.vars = latent_vars_use,
+    verbose = TRUE
+  )
+
+  
+  # Add gene column + labels
+  de_result$gene <- rownames(de_result)
+
+  de_result <- de_result %>%
+    mutate(
+      celltype = celltype_name,
+      significance = case_when(
+        p_val_adj < 0.05 & avg_log2FC > 0 ~ "Up in Cave",
+        p_val_adj < 0.05 & avg_log2FC < 0 ~ "Up in Surface",
+        TRUE ~ "Not significant"
+      )
+    ) %>%
+    arrange(desc(avg_log2FC))
+
+  return(de_result)
+}
+```
+
+label find markers volcano
+```{r}
+label_top_genes_fm <- function(de_result,
+                            logfc_thresh = 0,
+                            padj_thresh  = 0.05,
+                            top_n_per_side = 80) {
+  df <- de_result %>%
+    mutate(
+      # significance category for plotting
+      significance = case_when(
+        !is.na(p_val_adj) & p_val_adj < padj_thresh & avg_log2FC >  logfc_thresh ~ "Up in Cave",
+        !is.na(p_val_adj) & p_val_adj < padj_thresh & avg_log2FC < -logfc_thresh ~ "Up in Surface",
+        TRUE ~ "Not significant"
+      ),
+      # robust -log10(p_val_adj): guard against 0/NA
+      logP = -log10(pmax(p_val_adj, .Machine$double.xmin)),
+
+      # annotated = not LOC######## 
+      is_annotated = !grepl("^LOC\\d+$", final_gene_symbol)
+    )
+
+  # choose which points to label: top N per side by -log10(padj), annotated only
+  lab_idx <- df %>%
+    filter(significance != "Not significant", is_annotated) %>%
+    group_by(significance) %>%
+    slice_max(order_by = logP, n = top_n_per_side, with_ties = FALSE) %>%
+    ungroup() %>%
+    mutate(to_label = TRUE) %>%
+    select(final_gene_symbol, avg_log2FC, p_val_adj, to_label)
+
+  # attach labels; no join on floats for everything—only to mark the chosen labels
+  df <- df %>%
+    left_join(lab_idx,
+              by = c("final_gene_symbol","avg_log2FC","p_val_adj")) %>%
+    mutate(
+      label = ifelse(!is.na(to_label), final_gene_symbol, NA_character_)
+    ) %>%
+    select(-to_label)
+
+  df
+}
+```
+### Plotting
+```{r}
+mini_axis_umap <- function(
+  seurat_obj,
+  reduction = "umap",
+  group.by = NULL,
+  split.by = NULL,
+  label = TRUE,
+  shuffle = TRUE,
+  alpha = 0.8,
+  pt.size = 0.5,
+  axis_frac = 0.08,
+  pad_frac  = 0.03,
+  arrow_mm  = 2,
+  linewidth = 0.5,
+  add_labels = TRUE,
+  label_x = "UMAP 1",
+  label_y = "UMAP 2",
+  label_size = 3,
+  margin_mm = 5.5,
+  seed = NULL
+) {
+  stopifnot(inherits(seurat_obj, "Seurat"))
+
+  if (!is.null(seed)) set.seed(seed)
+
+  # 1) Base DimPlot
+  p <- DimPlot(
+    seurat_obj,
+    reduction = reduction,
+    group.by = group.by,
+    split.by = split.by,
+    label = label,
+    shuffle = shuffle,
+    alpha = alpha,
+    pt.size = pt.size
+  ) + NoLegend()
+
+  # 2) Remove axes completely
+  p_clean <- p +
+    theme_void() +
+    theme(plot.margin = margin(margin_mm, margin_mm, margin_mm, margin_mm, unit = "mm")) +
+    NoLegend()
+
+  # 3) Compute panel ranges
+  gb <- ggplot_build(p_clean)
+  pp <- gb$layout$panel_params[[1]]
+  x_rng <- pp$x.range
+  y_rng <- pp$y.range
+
+  x_span <- diff(x_rng)
+  y_span <- diff(y_rng)
+
+  # Bottom-left corner position (with padding)
+  x0 <- x_rng[1] + pad_frac * x_span
+  y0 <- y_rng[1] + pad_frac * y_span
+
+  # Mini-axis lengths
+  dx <- axis_frac * x_span
+  dy <- axis_frac * y_span
+
+  # 4) Add mini-axes + optional labels
+  p_final <- p_clean +
+    annotate(
+      "segment",
+      x = x0, xend = x0 + dx,
+      y = y0, yend = y0,
+      linewidth = linewidth,
+      arrow = arrow(type = "closed", length = unit(arrow_mm, "mm"))
+    ) +
+    annotate(
+      "segment",
+      x = x0, xend = x0,
+      y = y0, yend = y0 + dy,
+      linewidth = linewidth,
+      arrow = arrow(type = "closed", length = unit(arrow_mm, "mm"))
+    )
+
+  if (isTRUE(add_labels)) {
+    p_final <- p_final +
+      annotate(
+        "text",
+        x = x0 + dx, y = y0 - 0.01 * y_span,
+        label = label_x, hjust = 1, vjust = 1, size = label_size
+      ) +
+      annotate(
+        "text",
+        x = x0 - 0.01 * x_span, y = y0 + dy,
+        label = label_y, hjust = 1, vjust = 1, angle = 90, size = label_size
+      )
+  }
+
+  return(p_final)
+}
+```
+
+# . Data 
+load either full brain data set to subset or load subset
+```{r}
+#lSeq <- readRDS("lSeq.rds")
+lSeqGlia <- readRDS("lSeqGlia.rds")
+```
+
+Save
+```{r}
+SaveSeuratRds(lSeqGliaGen, "lSeqGliaGen.rds")
+```
+# . Subcluster to glia
+```{r}
+# lSeq <- readRDS("lSeq.rds")
+# Idents(lSeq) <- lSeq$finalbroadcelltypes
+# lSeqGlia <- subset(x = lSeq, idents = "Glia")
+```
+
+## Reprocess subset
+```{r}
+# lSeqGlia <- FindNeighbors(lSeqGlia, dims = 1:20, reduction = "harmony")
+# lSeqGlia <- FindClusters(lSeqGlia, resolution =c(0.6))
+# lSeqGlia <- RunUMAP(lSeqGlia, dims = 1:20, reduction = "harmony")
+```
+
+## UMAP
+```{r}
+#DimPlot acording to cluster identity
+DimPlot(object = (lSeqGlia),label=TRUE,  pt.size = 0.25) +
+  theme(axis.title.x=element_text(size=12),
+        axis.title.y=element_text(size=12))
+```
+# . Cell type DEGs
+```{r}
+pb <- AggregateExpression(
+  lSeqGlia,
+  assays        = "RNA",
+  slot          = "counts",
+  group.by      = c("population", "sample_id", "celltype"),
+  return.seurat = TRUE
+)
+
+cts <- GetAssayData(pb, assay = "RNA", layer = "counts")
+
+coldata <- pb@meta.data %>%
+  tibble::rownames_to_column("col_id") %>%     # rownames are the pseudo-bulk column IDs
+  transmute(
+    col_id     = col_id,
+    sample     = sample_id,
+    Population = factor(population, levels = c("surface", "cave")),
+    CellType   = celltype
+  )
+```
+## All cell types
+```{r}
+res <- run_all_celltype_deg_exports(
+  cts = cts,
+  coldata = coldata,
+  padj_cut = 0.05,
+  lfc_min = 0.5,
+  positive_only = TRUE,
+  out_csv = "GliaClusters_MarkerDEGs.csv"
+)
+```
+## Single cluster markers
+```{r}
+res <- deseq2_pb_annotation(
+  cts              = cts,     # pseudobulk count matrix (genes x columns)
+  coldata          = coldata,     # pseudobulk metadata
+  target_celltype  = "0"          
+)
+
+format_and_write_annotation_csv(
+  res_df = res$res_all,
+  neuro_cluster_label = "Glia0",
+  padj_cut = 0.05,
+  top_n = 500
+)
+```
+
+# . Annotate by cluster
+## Cluster 0: Tectal Ventricular Zone radial glia
+
+One-line identity: Cycling radial glia-like ventricular zone progenitors of the dorsal midbrain/optic tectum, defined by a strong mitotic and DNA-replication program along with tectal progenitor patterning genes and Notch-associated neural stem cell features (de Oliveira-Carlos et al., 2013; Matsunaga et al., 2001; Pose-Méndez et al., 2024; Thomas et al., 2006; Wong et al., 2010; Yu & He, 2019).  
+ 
+**Key evidence**
+
+  • Definitive cycling ventricular-zone progenitor program: mki67, pcna, ccnd1, cdk1, cdk2, plk1, top2a,
+  bub1, nuf2, kif11, kif23, aspm, anln, mcm2, mcm7, pole, pole2, prim2, dnmt1, brip1, bard1
+    → The dominant signal in this cluster is active cell cycling, including genes that code for DNA
+    replication, chromosome segregation, and genome maintenance. 
+ 
+  • Radial glia identity: notch1a, her8.2, foxn4, nr2e1, sox2
+    → Notch-associated stem cell markers support annotation as radial glia-like neural
+    stem/progenitor cells positioned at the ventricle. 
+ 
+  • Dorsal midbrain / tectal progenitor patterning program: pax7a, pax7b, pax3a, dmbx1a, dmbx1b, otx2b, zic3,
+  zic6, tenm3, plxnb3, efemp1
+    → These genes anchor the cluster to a dorsal mesencephalic/tectal progenitor identity rather than a
+    generic forebrain or hindbrain VZ. Ax7/pax3 are classic tectal regionalization genes, while dmbx1 genes
+    are directly implicated in zebrafish midbrain progenitor proliferation and differentiation.  
+
+  • Neurogenic but still progenitor-biased state: foxn4, sox11b, myt1a, ebf2, bcl11aa, tox, cbfa2t2
+    → This cluster is not simply quiescent radial glia. It carries a neurogenic transcriptional program
+    layered onto the VZ stem/progenitor state, consistent with cycling tectal radial glia and early
+    neurogenic progenitors within the ventricular zone.  
+ 
+  • Growth factor and morphogen responsiveness consistent with ventricular progenitors: ctnnb1, fsta, fstl1a,
+  plxnb3, efemp1
+    → These genes reinforce a patterning-responsive tectal VZ state that receives and interprets
+    developmental signaling cues.
+
+**Decision rule:** 
+
+The combined presence of a strong mitotic ventricular-zone program, radial glia / neural stem cell markers, and dorsal midbrain/tectal patterning genes supports annotation as tectal ventricular zone radial glia.  
+
+**Distinguishing note:**
+
+This cluster is distinguished from non-cycling radial glia by its very strong cell-cycle and DNA-replication signature, and from non-tectal progenitors by its tectal/dorsal midbrain patterning features, especially pax3/7 and dmbx1 gene expression.
+
+
+```{r}
+DotPlot(lSeqGlia, features = c(
+  
+    # Cycling ventricular-zone progenitor program
+    "mki67", "pcna", "ccnd1", "cdk1", "cdk2", "plk1", "top2a",
+    "bub1", "nuf2", "kif11", "kif23", "aspm", "anln",
+    "mcm2", "mcm7", "pole", "pole2", "prim2", "dnmt1", "brip1", "bard1",
+
+    # Radial glia identity
+    "notch1a", "her8.2", "foxn4", "nr2e1", "sox2",
+   
+    # Dorsal midbrain / tectal progenitor patterning
+    "pax7a", "pax7b", "pax3a", "dmbx1a", "dmbx1b",
+    "otx2b", "zic3", "zic6", "tenm3", "plxnb3", "efemp1",
+
+    # Neurogenic but progenitor-biased state
+    "sox11b", "myt1a", "ebf2", "bcl11aa", "tox", "cbfa2t2",
+
+    # Growth factor / morphogen responsiveness
+    "ctnnb1", "fsta", "fstl1a"
+    
+  )
+) + RotatedAxis()
+```
+
+
+## Cluster 1: Telencephalic / anterior forebrain ventricular zone radial glia
+
+One-line identity: Ventricular radial glia / neural progenitors of the anterior forebrain, dominated by core radial glia and progenitor features as well as patterning genes from the telencephalic and preoptic regions (Anneser et al., 2024; Ganz et al., 2012; Jurisch-Yaksi et al., 2020; März et al., 2010; Umeda et al., 2024; Viktorin et al., 2008).  
+ 
+**Key evidence**
+
+  • Core ventricular radial glia / progenitor program: slc1a3b, id4, notch1b, her8.2, sox2, gfap, nes,
+  fgfr3, fgfrl1a, fgfr4, lin28ab
+    → These genes support ventricular radial glia / neural stem-progenitor identity. 
+ 
+  • Strong telencephalic regional patterning signature: foxg1a, emx2, emx3, fezf1, fezf2, lhx2b, lhx5, pax6b,
+  zbtb18, zbtb20, wnt8b
+   → These genes support a telencephalic regional annotation: foxg1a is a canonical telencephalic regulator,
+   emx genes support pallial forebrain identity, and pallial/subpallial molecular maps in zebrafish use emx,
+   dlx, fezf, and foxg1-family logic to define forebrain territories.  
+  
+  • Ventral / preoptic / anterior forebrain signature: nkx2.4a, nkx2.4b, vax1, vax2, rx3
+   → These genes support anterior ventral forebrain / preoptic-hypothalamic proximity and imply that this
+   cluster may capture a broader anterior forebrain VZ population rather than a strictly telencephalon-only
+   radial glia class.  
+  
+  • Radial-glia-associated signaling and niche cues: reln, epha2a, epha7, sema3d, robo1, rgma, wnt7ba,
+  wnt7bb, wnt8b, aldh1a2
+   → These genes fit a ventricular progenitor niche that is still actively patterning the surrounding
+   forebrain, rather than a terminal support-glia state. In this context they reinforce a developmental
+   forebrain VZ identity.  
+
+**Decision rule:** 
+
+The combination of ventricular radial glia markers with a foxg1a/emx/fezf/lhx/pax6 telencephalic patterning program and nkx2.4/rx3/vax anterior ventral forebrain/preoptic region program supports the annotation as telencephalic/anterior forebrain radial glia
+
+**Distinguishing note:** 
+
+This cluster is defined by a forebrain-specific ventricular zone identity rather than a generic radial glia state or alternative regional progenitor population. The key distinction is the co-occurrence of canonical radial glia markers (slc1a3b, gfap, notch1b, her8.2, and sox2) with a dense telencephalic transcriptional program (foxg1a, emx2/emx3, fezf1/2, lhx2b, pax6b, and zbtb18).
+
+```{r}
+DotPlot(lSeqGlia, features = c(
+  
+    # Core ventricular radial glia / progenitor program
+    "slc1a3b", "id4", "notch1b", "her8.2", "sox2", "gfap", 
+    "nes", "fgfr3", "fgfrl1a", "fgfr4", "lin28ab",
+
+    # Telencephalic regional patterning
+    "foxg1a", "emx2", "emx3", "fezf1", "fezf2",
+    "lhx2b", "lhx5", "pax6b", "zbtb18", "zbtb20", "wnt8b",
+
+    # Ventral / preoptic / anterior forebrain signature
+    "nkx2.4a", "nkx2.4b", "vax1", "vax2", "rx3",
+
+    # Radial glia niche / signaling environment
+    "reln", "epha2a", "epha7", "sema3d", "robo1", "rgma",
+    "wnt7ba", "wnt7bb", "aldh1a2"
+    
+  )
+) + RotatedAxis()
+```
+
+## Cluster 2: Astrocytes
+
+One-line identity: Mature parenchymal astrocytes defined by strong neurotransmitter-clearance, metabolic-support, and gliovascular-coupling programs. This cluster expresses canonical astrocytic transporter and glutamine-synthetase genes without a dominant expression of ventricular zone radial glia genes (Anneser et al., 2024; J. Chen et al., 2020; Grupp et al., 2010; Luo et al., 2023).  
+ 
+**Key evidence**
+
+  • Core astrocyte homeostatic and neurotransmitter-clearance machinery: slc1a2b, slc7a10a, slc7a10b,
+  slc6a13, slc6a11b, slc6a1b, slc6a9, slc38a3a, glula, glulb, mgll, aqp4, kcnj13, slc8a2a, slc4a4a, ca4a
+    → This cluster is strongly enriched for genes expected in mature astrocytes that buffer glutamate, GABA,
+    glycine, ions, water, and metabolic intermediates. The combination of EAAT2-like glutamate uptake,
+    glutamine synthetase, inhibitory neurotransmitter uptake, and osmotic/ionic regulators supports a
+    differentiated astrocyte identity centered on parenchymal homeostasis rather than progenitor maintenance.
+    Chen et al. specifically identified zebrafish astrocytes expressing glast/slc1a3b, slc1a2b, glutamine
+    synthetase, and slc6a11b, providing direct zebrafish support for this transporter-rich astrocytic
+    program.  
+    
+  • Astrocyte extracellular-matrix and vascular-coupling program: mfge8a, megf10, tspan18b, vegfba, vcam1b,
+  robo4, gpc5b, cspg5a, cspg5b, fgfbp3, angptl4, slco1e1
+    → These genes support astrocytes that interact with extracellular matrix, vasculature, and neighboring
+    neuronal elements. The DEG profile is enriched for trophic, adhesive, and vascular-associated molecules
+    rather than epithelial or ventricular lining genes, fitting parenchymal astrocytes with gliovascular and
+    synapse-adjacent support roles. 
+
+  • Mature astrocytic metabolic-support state: glula, glulb, mgll, hkdc1, psat1, me1, dhrs3b, acer4, acad11,
+  acss2l, gpam, pfkfb4a
+    → This cluster contains a strong metabolic-support signature consistent with astrocytic roles in
+    glutamate–glutamine cycling, lipid handling, redox buffering, and energetic support of neurons. This is
+    more consistent with differentiated astrocytes than with cycling radial glia or immature progenitors. 
+
+**Decision rule:** 
+
+The combined presence of strong astrocytic neurotransmitter-uptake genes, glutamine synthetase, metabolic-support pathways, and gliovascular/ECM-associated genes, together with the absence of a strong cycling radial glia signature, supports annotation as mature parenchymal astrocytes.
+
+**Distinguishing note:** 
+
+This cluster is distinguished from ventricular radial glia by its much stronger homeostatic transporter and metabolic program, especially slc1a2b, slc6a11b, slc6a13, slc6a9, slc38a3a, glula/glulb, and aqp4-like astrocytic support functions. It is also more parenchymal and support-oriented than progenitor-like glia, with greater emphasis on neurotransmitter clearance, vascular coupling, and extracellular interaction than on stem-cell maintenance or neurogenic cell-cycle activity.
+
+
+```{r}
+DotPlot(lSeqGlia, features = c(
+  
+    # Core astrocyte neurotransmitter-clearance / homeostasis
+    "slc1a2b", "slc7a10a", "slc7a10b", "slc6a13", "slc6a11b",
+    "slc6a1b", "slc6a9", "slc38a3a", "glula", "glulb",
+    "mgll", "aqp4", "kcnj13", "slc8a2a", "slc4a4a", "ca4a",
+
+    # ECM / vascular-coupling / astrocyte interaction program
+    "mfge8a", "megf10", "tspan18b", "vegfba", "vcam1b", "robo4",
+    "gpc5b", "cspg5a", "cspg5b", "fgfbp3", "angptl4", "slco1e1",
+
+    # Metabolic-support program
+    "hkdc1", "psat1", "me1", "dhrs3b", "acer4",
+    "acad11", "acss2l", "gpam", "pfkfb4a"
+    
+  )
+) + RotatedAxis()
+```
+## Cluster 3: Cerebellar ventricular-zone radial glia (MHB-associated)
+
+One-line identity: Cerebellar ventricular-zone radial glia associated with the midbrain–hindbrain boundary (MHB), defined by strong FGF organizer signaling and progenitor-state markers (Gibbs et al., 2017; Hirate & Okamoto, 2006; Kaslin et al., 2013; Pose-Méndez et al., 2023).
+ 
+**Key evidence**
+
+  • MHB / cerebellar organizer-patterning program:cnpy1, fgf3, fgf8a, fgf8b, fgf10a, fgf22, fgf24, fgfrl1a,
+  crabp1a
+    → This cluster shows a clear FGF-linked organizer signature centered on genes associated with the
+    zebrafish midbrain–hindbrain boundary and adjacent cerebellar territory. 
+ 
+  • Cerebellar / MHB regional identity genes: dmbx1b, lhx2b, zic2a, tbx2b, tbx3a, foxn4, gbx2, otx2b
+    → These genes support a patterned hindbrain–cerebellar progenitor territory rather than a generic glial
+    state. In zebrafish, the cerebellum develops from dorsal rhombomere 1 under organizer influence from the
+    MHB, so this combination is most consistent with cerebellar progenitor-zone localization.  
+ 
+  • Immature glial / progenitor features: pdgfra, cspg4ba, smoc1, smoc2, cntfr, nes
+    → The cluster contains genes consistent with immature glial or progenitor-zone support cells, fitting a
+    progenitor-associated cerebellar glial population.  
+ 
+  • Developmental signaling and boundary-associated guidance: efna5b, epha2b, nrp2b, rgmd, plxdc2b
+    → These genes encode components of Eph/ephrin, semaphorin/neuropilin, and BMP-associated signaling
+    systems that mediate cell segregation, positional identity, and axon guidance, genes supporting the
+    annotation of a progenitor population embedded in a regionally patterned, boundary-associated
+    developmental environment.
+
+**Decision rule:**
+
+The combined presence of cnpy1 with multiple FGF-pathway and cerebellar/MHB-associated genes supports annotation as cerebellar progenitor-zone glia.
+
+**Distinguishing note:**
+
+This cluster is distinguished from other ventricular-zone glia by its MHB/cerebellar organizer signature, especially cnpy1 and fgf genes. It is distinguished from mature astrocytes by its progenitor-like developmental profile and weaker homeostatic transporter signature.
+
+
+```{r}
+DotPlot(lSeqGlia, features = c(
+  
+    # MHB / cerebellar organizer-patterning program
+    "cnpy1", "fgf3", "fgf8a", "fgf8b", "fgf10a", "fgf22",
+    "fgf24", "fgfrl1a", "crabp1a",
+
+    # Cerebellar / MHB regional identity
+    "dmbx1b", "lhx2b", "zic2a", "tbx2b", "tbx3a",
+    "foxn4", "gbx2", "otx2b",
+
+    # Immature glial / progenitor features
+    "pdgfra", "cspg4ba", "smoc1", "smoc2", "cntfr", "nes",
+
+    # Boundary-associated guidance / signaling
+    "efna5b", "epha2b", "nrp2b", "rgmd", "plxdc2b"
+    
+  )
+) + RotatedAxis()
+```
+## Cluster 4: Ventral hypothalamic tanycyte-like radial glia
+
+One-line identity: Specialized ventricular radial glia of the ventral hypothalamus with a tanycyte-like profile, defined by ventricular glial markers, strong ventral hypothalamic patterning genes, prominent Shh/Wnt signaling, extracellular matrix and guidance programs, and a ciliogenesis module consistent with a ventricular lining cell specialized for hypothalamic niche signaling rather than a generic radial glial or ependymal state (Ceriani & Whitlock, 2021; D’Gama et al., 2021; Duncan et al., 2016; Male et al., 2020; Manoli & Driever, 2014; Norton et al., 2005; Sedykh et al., 2018).  
+ 
+**Key evidence**
+
+  • Tanycyte / ventricular radial glia core markers: ptn, pkd1b, prom1a, lama2, hapln1a, sparcl1, nrcama,
+  gpc5b
+    → This cluster shows a strong ventricular glial profile defined by apical-surface markers and
+    extracellular matrix components associated with the ventricular niche. In zebrafish, tanycytes represent
+    a specialized subtype of hypothalamic ventricular radial glia with persistent progenitor capacity and
+    niche-associated signaling functions.
+
+  • Ventral hypothalamic patterning program: foxa, foxa1, foxa2, shha, shhb, nkx6.1, lmx1ba, lmx1bb, arxa,
+  rfx4
+    → These genes strongly support ventral hypothalamic identity. This patterning program is characteristic
+    of ventral midline progenitor domains from which tanycyte populations arise, distinguishing this cluster
+    from dorsal or non-hypothalamic radial glia.
+ 
+  • Posterior / ventral hypothalamic signaling environment: wnt4, wnt4b, wnt11, wnt16, efnb3a, ntn1b,
+  cxcl12a, slit1a, slit2, slit3
+    → The transcriptome is enriched for secreted morphogens and guidance cues, consistent with a
+    signaling-active ventricular niche. This profile supports a tanycyte identity, as these cells function as
+    locally signaling progenitors that regulate hypothalamic neurogenesis and tissue organization.
+ 
+  • Ciliogenesis and ventricular specialization: foxj1a, dnah2, dnah7, cfap100, cfap298, urp2, cdkn1ba
+    → This cluster carries a clear ciliogenesis program consistent with ventricular-surface specialization.
+    Tanycytes are ciliated ventricular radial glia so the cooccurrence of foxj1a and axonemal dynein
+    components (dnah and cfap genes) motile cilia genes with ventral hypothalamic patterning and
+    tanycyte-associated niche features supports a specialized tanycyte identity rather than a purely
+    ependymal cell type.
+ 
+  • Secretory / niche-regulatory and neuroendocrine-adjacent features: pam, nr4a3, igf2b, cxcl12a, scube1,
+  scube3
+    → These genes support a signaling-active ventricular niche population with neuroendocrine-adjacent
+    regulatory capacity. The presence of peptide-processing enzymes (pam), growth factors (igf2b), chemokines
+    (cxcl12a), and secreted signaling modulators (scube genes) is consistent with tanycytes, which function
+    as locally signaling ventricular cells that regulate hypothalamic neurogenesis and neuroendocrine
+    circuits.
+
+**Decision rule:** 
+
+The combined presence of a ventricular radial glia scaffold, strong ventral hypothalamic foxa–shh–lmx1b–nkx logic, and a ciliogenesis module supports annotation as ventral hypothalamic tanycyte-like radial glia.  
+
+**Distinguishing note:**
+
+This cluster is distinguished from broader hypothalamic ventricular radial glia by its stronger ventral floor-plate-like hypothalamic patterning signature and from more generic ependymal cells by its retention of hypothalamic niche-signaling genes such as shha, shhb, wnt4/wnt4b, cxcl12a, and slit family members. Functionally, these cells most likely represent a specialized ventricular glial niche at the ventral hypothalamic surface.  
+
+```{r}
+DotPlot(lSeqGlia, features = c(
+  
+    # Tanycyte / ventricular radial glia core markers
+    "ptn", "pkd1b", "prom1a", "lama2", "hapln1a",
+    "sparcl1", "nrcama", "gpc5b",
+
+    # Ventral hypothalamic patterning
+    "foxa", "foxa1", "foxa2", "shha", "shhb",
+    "nkx6.1", "lmx1ba", "lmx1bb", "arxa", "rfx4",
+
+    # Posterior / ventral hypothalamic signaling
+    "wnt4", "wnt4b", "wnt11", "wnt16",
+    "efnb3a", "ntn1b", "cxcl12a",
+    "slit1a", "slit2", "slit3",
+
+    # Ciliogenesis / ventricular specialization
+    "foxj1a", "dnah2", "dnah7", "cfap100", "cfap298", "urp2", "cdkn1ba",
+
+    # Secretory / niche-regulatory features
+    "pam", "nr4a3", "igf2b", "scube1", "scube3"
+    
+  )
+) + RotatedAxis()
+```
+## Cluster 5: Ependymal dorsal VZ radial glia
+
+One-line identity: Dorsal ventricular zone radial glia transitioning into a multiciliated ependymal lineage, defined by a strong FOXJ1/ciliogenesis program, dorsal roof-plate patterning code, and Wnt/BMP-rich ventricular signaling consistent with roof-plate–derived ventricular epithelium (D’Gama et al., 2021; Elsen et al., 2008; Kondrychyn et al., 2013; Sunmonu et al., 2011; Yamaguchi et al., 2018).  
+ 
+**Key evidence**
+
+  • Multiciliated ependymal differentiation program: foxj1b, sspo, prom1a, dnaaf1, dnaaf3, dnah5, dnah7,
+  cfap91, ift88, gas8, ttc21b
+    → This is the strongest signal in the cluster. The combination of foxj1b with broad axonemal dynein,
+    CFAP, tektin, and intraflagellar transport machinery supports ventricular cells actively engaged in
+    motile-cilia differentiation, which is a defining feature of zebrafish ependymal lineages.  
+  
+  • Dorsal VZ / roof-plate positional program: zic1, zic2a, zic4, zic5, zic6, msx1b, lmx1ba, lmx1bb, rxrab,
+  pax2b
+    → The dense Zic/Msx dorsal patterning code strongly supports dorsal ventricular origin. In zebrafish,
+    Zic1 and Zic4 are specifically linked to roof-plate specification and hindbrain ventricle morphogenesis,
+    which fits this cluster much better than a generic ventricular glial label.  
+  
+  • Roof-plate signaling environment rather than generic glial maintenance: wnt1, wnt3, wnt4, wnt7ba, fgf8b,
+  bmp6, bmper, acvr1ba, axin2, cnpy1
+    → This cluster is enriched for dorsal organizer-style morphogen signaling, especially Wnt/BMP and
+    FGF-associated genes, which is characteristic of roof-plate or dorsal ventricular epithelium. This is not
+    the transcriptional profile expected for broad radial glia maintenance alone.  
+  
+  • Ventricular epithelial / basal lamina organization: sparc, col15a1a, col16a1, col4a5, frem1a, cdh6,
+  cldn7a, cadm1b, tgfbr3, adamts10
+    → These genes support apical-basal epithelial organization, extracellular matrix assembly, and
+    ventricular surface specialization, consistent with developing ependymal ventricular cells rather than
+    migratory progenitors or mature parenchymal glia.  
+  
+  • Radial glia / progenitor heritage: sox2, vim, her4.1, fgfr3
+    → These genes indicate that the population still retains ventricular progenitor ancestry, but the cluster
+    is no longer best described as generic radial glia because the ciliogenesis and epithelial specialization
+    modules are much stronger.  
+
+**Decision rule:** 
+
+The combined presence of foxj1b-driven multiciliation, extensive motile-cilia structural genes, strong dorsal Zic/Msx patterning, and roof-plate Wnt/BMP signaling supports annotation as ependymal dorsal VZ radial glia, best interpreted as a dorsal ventricular radial glia-to-ependymal transition state.
+
+**Distinguishing note:**
+
+This cluster is distinguished from hypothalamic tanycyte-like ventricular glia by its dorsal Zic/Msx/roof-plate patterning code and robust FOXJ1 multiciliation program, and from broader ventricular radial glia by its much stronger ependymal differentiation machinery and ventricular epithelial ECM signature. Functionally, these cells appear to represent dorsal ventricular glia committing to a multiciliated ependymal identity.
+
+```{r}
+DotPlot(lSeqGlia, features = c(
+  
+    # Multiciliated ependymal differentiation
+    "foxj1b", "sspo", "prom1a",
+    "dnaaf1", "dnah5", "dnah7",
+    "ift88",
+
+    # Dorsal VZ / roof-plate patterning
+    "zic1", "zic2a", "zic4",
+    "msx1b", "lmx1ba", "pax2b",
+
+    # Roof-plate signaling environment
+    "wnt1", "wnt3", "wnt7ba",
+    "fgf8b", "bmp6", "axin2", "cnpy1",
+
+    # Ventricular epithelial / ECM organization
+    "sparc", "col15a1a", "col4a5",
+    "frem1a", "cdh6", "cldn7a",
+
+    # Residual radial glia heritage
+    "sox2", "vim", "LOC103040661", "fgfr3" # "LOC103040661" = "her4.1"
+    
+  )
+) + RotatedAxis()
+```
+## Clusters 6/11: OPCs
+
+One-line identity: Oligodendrocyte precursor cells (OPCs) in an early, highly interactive state, defined by core OPC lineage markers together with strong neuronal communication, synaptic adhesion, neurotransmitter receptor, and excitability programs, consistent with OPCs that are actively sensing and integrating neural activity rather than fully differentiated myelinating oligodendrocytes (Akay et al., 2021; Bromley-Coolidge et al., 2024; Kuhn et al., 2019; J. Li et al., 2024; Marisca et al., 2020; Ravanelli et al., 2018).  
+ 
+**Key evidence**
+
+  • Core OPC lineage program: olig1, olig2 ,cspg4, qkia, lingo1a, lingo1b, gfra4b, ppp1r14bb, sox10
+    → This cluster contains a clear oligodendrocyte-lineage precursor signature, especially olig1 and cspg4,
+    which strongly supports OPC identity rather than neuronal or astroglial annotation. In zebrafish,
+    persistent OPC populations are molecularly distinct from differentiating oligodendrocytes and cspg4 is a
+    conserved OPC marker.  
+  
+  • Synaptic adhesion and neuron-contact machinery:  nlgn1, nlgn2a, nlgn2b, nlgn3a, lrrtm2, lrfn1, lrfn2b,
+  lrfn5b, cntnap5b, dscamb, cadm3, sdk2a, sdk2b, ptprdb, ptprub, ptprua
+    → This DEG profile is heavily enriched for synapse-like recognition and adhesion genes, consistent with
+    OPCs making structured contacts with axons and responding to neuronal signals. This interpretation
+    matches zebrafish work showing oligodendroglial cells use synaptic proteins and neuron-glia contacts
+    during myelin-related development.  
+    
+  • Neurotransmitter receptor and excitability-rich state:vgria1a, gria1b, gria4a, grik2, grik4, grik5,
+  grin3ba, gabbr1b, gabrb2a, htr1d, kcnj6, kcnd1, kcnn3, kcnip3a, cacng2a, cacng4a, cacng8a, clcn2a, asic1b,
+  asic1c
+    → These genes support a physiologically responsive OPC state. OPCs are known to receive synaptic input
+    and exhibit activity-dependent calcium signaling. Zebrafish studies specifically support neuron-OPC
+    synapses as functionally important for later myelin sheath formation.  
+  
+  • Axon-guidance, migration, and surveillance features: sema5a, sema4ba, sema6ba, sema6e, efna3a, plxnb1a,
+  hapln3, col27a1a, adamts6, ptprk, ptprfa, ptprma
+    → These genes fit a motile, environment-sensing precursor rather than a stable mature oligodendrocyte,
+    supporting the interpretation of OPCs navigating and sampling axonal territory while remaining
+    developmentally plastic.  
+
+**Decision rule:** 
+
+The combined presence of olig1/cspg4 OPC markers, absence of a dominant mature-myelin program, and very strong synaptic adhesion, receptor, and excitability modules supports annotation as early interactive OPCs.
+
+**Distinguishing note:** 
+
+This cluster is distinguished from more mature oligodendrocyte-lineage cells by its much stronger neuron-contact and receptor-rich profile, and from non-glial neuronal clusters by its retained OPC lineage core. Functionally, these cells appear to represent OPCs that are still highly engaged in axon sensing, synaptic communication, and activity-dependent fate regulation.  
+
+```{r}
+DotPlot(lSeqGlia, features = c(
+  
+    # Core OPC lineage program
+    "olig1", "olig2", "cspg4", "qkia", "lingo1a", "lingo1b",
+    "gfra4b", "ppp1r14bb", "sox10",
+
+    # Synaptic adhesion / neuron-contact machinery
+    "nlgn1", "nlgn2a", "nlgn2b", "nlgn3a",
+    "lrrtm2", "lrfn1", "lrfn2b", "lrfn5b",
+    "cntnap5b", "dscamb", "cadm3", "sdk2a", "sdk2b",
+    "ptprdb", "ptprub", "ptprua",
+
+    # Neurotransmitter receptor / excitability-rich state
+    "gria1a", "gria1b", "gria4a", "grik2", "grik4", "grik5",
+    "grin3ba", "gabbr1b", "gabrb2a", "htr1d",
+    "kcnj6", "kcnd1", "kcnn3", "kcnip3a",
+    "cacng2a", "cacng4a", "cacng8a",
+    "clcn2a", "asic1b", "asic1c",
+
+    # Axon-guidance / migration / surveillance
+    "sema5a", "sema4ba", "sema6ba", "sema6e",
+    "efna3a", "plxnb1a", "hapln3", "col27a1a",
+    "adamts6", "ptprk", "ptprfa", "ptprma"
+    
+  )
+) + RotatedAxis()
+```
+## Cluster 7: Early oligodendrocytes
+
+One-line identity: Early differentiating oligodendrocytes transitioning out of the OPC state, defined by retained oligodendrocyte-lineage markers together with strong pre-myelinating and early myelin programs, plus persistent axon-contact and receptor-rich features (Y. Chen et al., 2009; Kuhn et al., 2019; Santos-Ledo et al., 2023; Takada et al., 2010; Treichel & Hines, 2018).
+ 
+**Key evidence**
+
+  • Core oligodendrocyte-lineage identity: olig2, sox10, nkx2.2a, myrf, zeb2a, zeb2b, st18, sox6
+    → This cluster is firmly within the oligodendrocyte lineage. The combination of sox10, olig2, nkx2.2a,
+    myrf, and zeb2 factors places it developmentally beyond a generic OPC state and into an actively
+    differentiating oligodendrocyte trajectory.
+ 
+  • Early OL / premyelinating program: gpr17, bcas1, mag, mbpb, mbpa, abca2, plp2b, lingo1a, myrf
+    → These are the strongest features distinguishing this cluster from OPCs. Gpr17 and bcas1 are classic
+    transitional early OL markers, while mag and mbp-family genes indicate that myelin differentiation has
+    begun but is not yet fully mature.
+  
+  • Emerging myelin structural identity without a fully mature compact-myelin state:  mbpb, mbpa, mag, plp2b,
+  abca2, cldn19
+    → This cluster has clearly initiated myelin gene expression, which argues against an OPC annotation. At
+    the same time, the profile still looks earlier than fully mature myelinating oligodendrocytes because the
+    program is mixed with strong transitional, morphogenetic, and signaling genes.
+ 
+  • Persistent axon-glia interaction and adhesion machinery: cadm4, cntn1a, nfasca, opcml, tnr, vcanb,
+  plxna3, plxnb2b, sema4ga, sema3b, sema5a
+    → These genes support active axon engagement, process extension, and axoglial contact formation. That
+    fits an early oligodendrocyte state that is beginning to establish stable interactions with axons during
+    pre-myelinating differentiation.
+
+  • Receptor-rich, still-responsive transitional state: gria3a, grik3, grm1a, grm5b, kcnh5a, kcnj10a, gpr17,
+  gfra3, gfra4a, gpr52
+    → Compared with a more mature OL state, this cluster still shows substantial signaling responsiveness and
+    environmental sensing, consistent with newly differentiating OLs that have not yet fully shut down
+    precursor-like interaction programs.
+
+**Decision rule:** 
+
+The presence of oligodendrocyte-lineage TFs together with strong transitional early OL markers and clear onset of myelin-gene expression supports annotation as early oligodendrocytes rather than OPCs.
+
+**Distinguishing note:** 
+
+This cluster is more mature than OPCs because it expresses a much stronger early myelin and differentiation program, especially myrf, gpr17, bcas1, mag, and mbp-family genes. In contrast, the more OPC-like state is dominated by precursor identity and neural interaction genes without this degree of myelin initiation.
+
+```{r}
+DotPlot(lSeqGlia, features = c(
+  
+    # Core oligodendrocyte-lineage identity
+    "olig2", "sox10", "nkx2.2a", "myrf", "zeb2a", "zeb2b", "st18", "sox6",
+
+    # Early OL / premyelinating program
+    "gpr17", "bcas1", "mag", "mbpb", "mbpa", "abca2", "plp2b", "lingo1a",
+
+    # Emerging myelin structural identity
+    "cldn19",
+
+    # Axon-glia interaction / adhesion
+    "cadm4", "cntn1a", "nfasca", "opcml", "tnr", "vcanb",
+    "plxna3", "plxnb2b", "sema4ga", "sema3b", "sema5a",
+
+    # Receptor-rich transitional state
+    "gria3a", "grik3", "grm1a", "grm5b",
+    "kcnh5a", "kcnj10a", "gfra3", "gfra4a", "gpr52"
+    
+  )
+) + RotatedAxis()
+```
+## Cluster 8: Hypothalamic Ventricular Zone radial glia
+
+One-line identity: Ventral hypothalamic / ventral diencephalic radial glia lining the ventricular zone, defined by a Shh-responsive ventral forebrain patterning program together with radial glial markers and ventricular-surface signaling features, most strongly supported by nkx2.1 / nkx2.2-family, shha, foxa-family, and sim1a-associated hypothalamic markers (Diotel et al., 2010, 2015; Duncan et al., 2016; Male et al., 2020; Manoli & Driever, 2014; Mathieu et al., 2002; Ryu & Wolf, 2013). 
+ 
+**Key evidence**
+
+  • Definitive ventral hypothalamic / ventral diencephalic patterning program/ Hypothalamic lineage support:
+  foxa, foxa1, foxa2, shha, shhb, nkx2.1, nkx2.2a, nkx2.2b, sim1a
+   → Hedgehog signaling is a core pathway in hypothalamic regionalization and nkx2.1/nkx2.4-family genes are
+   directly required for hypothalamic development and basal hypothalamic patterning. Sim1a is also linked to
+   hypothalamic and posterior tubercular differentiation programs and is required to form the posterior
+   hypothalamus.
+
+  • Radial glia / ventricular glial identity: fabp7a, s100b, glula, gpm6ba, gfod1
+   → These genes support a glial ventricular-zone identity rather than a neuronal cluster. In this context,
+   the regional patterning program sits on top of a radial glia-like state, making the best interpretation
+   hypothalamic VZ radial glia rather than differentiated hypothalamic neurons.
+
+  • Ventricular-zone signaling / niche features consistent with hypothalamic RG: wnt11, cxcl12b, sulf1,
+  slc6a11b, slc6a1b, slc1a2b, itpr3
+   → These genes fit a signaling-responsive ventricular niche rather than a mature parenchymal glial
+   population, supporting a specialized ventricular surface / progenitor-zone state.
+ 
+  • Axon guidance / morphogen-routing environment expected near ventral hypothalamic ventricular surfaces:
+  ntn1b, slit1a, sema3e, rgma, efna1b, celsr2
+   → These genes are consistent with a ventricular organizer-like or morphogen-routing niche in developing
+   ventral forebrain tissue. They support the idea that this is a patterned ventricular glial population
+   helping shape local hypothalamic environment rather than a generic astrocyte class.
+ 
+  • Glial transport and signaling responsiveness consistent with VZ physiology: slc6a11b, slc6a9, slc6a1b,
+  slc8a1b, itpr3
+   → These transporters and signaling genes are compatible with ventricular glial physiology and
+   neurotransmitter handling, supporting a specialized radial glial population that is responsive to local
+   circuit and niche signals rather than a purely structural epithelial population. The presence of
+   astroglial/radial-glial transport genes alongside hypothalamic patterning genes reinforces a ventricular
+   glial interpretation.  
+
+**Decision rule:**
+
+The combination of nkx2.1 / nkx2.2-family, shha/shhb, and foxa-family ventral patterning genes with clear radial glial markers supports annotation as hypothalamic ventricular zone radial glia. 
+
+**Distinguishing note:** 
+
+This cluster is distinguished from generic ventricular glia by its strong ventral hypothalamic patterning code, especially shha, foxa-family,nkx2-family. It is also distinguishable from the more specialized tanycyte-like cluster because the strongest evidence here is for patterned hypothalamic VZ radial glia, not a more terminal tanycyte transport/secretory state.
+
+```{r}
+DotPlot(lSeqGlia, features = c(
+  
+    # Ventral hypothalamic / ventral diencephalic patterning
+    "foxa", "foxa1", "foxa2", "shha", "shhb",
+    "nkx2.1", "nkx2.2a", "nkx2.2b", "sim1a",
+
+    # Radial glia / ventricular glial identity
+    "fabp7a", "s100b", "glula", "gpm6ba", "gfod1",
+
+    # Ventricular-zone signaling / niche features
+    "wnt11", "cxcl12b", "sulf1", "slc6a11b", "slc6a1b", "slc1a2b", "itpr3",
+
+    # Axon guidance / morphogen-routing environment
+    "ntn1b", "slit1a", "sema3e", "rgma", "efna1b", "celsr2",
+
+    # Glial transport / signaling responsiveness
+    "slc6a9", "slc8a1b"
+    
+  )
+) + RotatedAxis()
+```
+## Cluster 9: Myelinating oligodendrocytes
+
+One-line identity: Mature, actively myelinating oligodendrocytes, defined by a dense myelin-structural program together with oligodendrocyte-lineage transcription factors and paranodal/junctional myelin components, consistent with differentiated CNS oligodendrocytes rather than OPCs or early premyelinating (Bai et al., 2014; Brösamle & Halpern, 2002; Collins et al., 2025; H. Li et al., 2007; Münzel et al., 2012).
+ 
+**Key evidence**
+
+  • Strong compact-myelin structural program: mbpa, mbpb, mpz, mag, plp1a, plp1b, cldnk, cldn19
+    → This cluster is dominated by canonical myelin genes, indicating active myelin sheath production rather
+    than precursor identity.
+ 
+  • Oligodendrocyte-lineage transcriptional identity: sox10, myrf, qki2, st18, prox1a, rundc3aa
+   → These genes anchor the cluster within the oligodendrocyte lineage and support a differentiated
+   myelinating state.
+
+  • Mature myelin membrane specialization: nfascb, nfasca, gjc2, tjp1a, cd9b
+   → Enrichment of junctional and paranodal membrane-associated genes supports organized sheath architecture
+   and axon-glial domain specialization.
+
+  • Differentiated oligodendrocyte maturation program: enpp6, bcas1, cd82a, aspa, slc44a1b, acsl1b, elovl7a
+   → These genes support late-stage oligodendrocyte differentiation, membrane lipid remodeling, and myelin
+   maintenance.
+  
+**Decision rule:**
+
+The combined presence of very strong CNS myelin structural genes, oligodendrocyte-lineage regulators, and junctional/paranodal myelin components supports annotation as myelinating oligodendrocytes.  
+
+**Distinguishing note:** 
+
+This cluster is distinguished from OPCs and early OLs by its much heavier compact-myelin program, especially mbpa/mbpb, mpz, mag, plp1a/plp1b, cldnk, cldn19, nfascb, and gjc2, indicating established myelin production rather than merely oligodendrocyte-lineage commitment.  
+
+```{r}
+DotPlot(lSeqGlia, features = c(
+  
+    # Strong compact-myelin structural program
+    "mbpa", "mbpb", "mpz", "mag",
+    "plp1a", "plp1b", "cldnk", "cldn19",
+
+    # Oligodendrocyte-lineage transcriptional identity
+    "sox10", "myrf", "qki2", "st18",
+    "prox1a", "rundc3aa",
+
+    # Mature myelin membrane specialization
+    "nfascb", "nfasca", "gjc2", "tjp1a", "cd9b",
+
+    # Differentiated oligodendrocyte maturation program
+    "enpp6", "bcas1", "cd82a", "aspa",
+    "slc44a1b", "acsl1b", "elovl7a"
+    
+  )
+) + RotatedAxis()
+```
+
+## Cluster 10: Microglia
+
+One-line identity: Brain-resident microglia with a canonical zebrafish myeloid/microglial program, defined by csf1r-dependent microglial identity genes, irf8/spi1 lineage regulators, and strong lysosomal-phagocytic machinery, consistent with differentiated microglia rather than non-resident macrophages or other glia (Herbomel et al., 2001; Kuil et al., 2020; Mazzolini et al., 2020; Oosterhof et al., 2018; Peri & Nüsslein-Volhard, 2008; Shiau et al., 2015; Silva et al., 2021).  
+ 
+**Key evidence**
+
+  • Definitive microglial / myeloid identity: csf1ra, csf1rb, ptprc, cd68, mpeg1* (LOC103034161), lcp1,
+  coro1a
+     → This is the clearest anchor for the cluster. In zebrafish, microglia are defined by macrophage-lineage
+     identity and depend strongly on csf1r signaling for normal brain colonization and maintenance;
+     mpeg1-positive brain macrophages are the canonical population used to mark zebrafish
+     microglia/macrophages.  
+ 
+  • Microglial lineage-specifying transcription factors: irf8, spi1a, mafba, irf5
+     → These genes strongly support resident microglial identity rather than generic immune contamination:
+     irf8 is a key zebrafish regulator required for normal microglial development, and spi1/pu.1 is a core 
+     myeloid lineage regulator. 
+ 
+  • Strong phagocytic and lysosomal program: ctsla, ctsba, ctsc, ctsh, ctsz, lgmn, dnase2, mcoln1a, atp6v1ba,
+  tcirg1b
+     → This cluster is heavily enriched for endolysosomal and degradative machinery, which fits the
+     scavenging and phagocytic role of zebrafish microglia in the CNS at 6 dpf. 
+ 
+  • Immune surveillance and signaling receptors: fcer1g, tnfrsf1b, il10rb, syk, btk, inpp5d, ptpn6, lyn,
+  pik3cg
+     → These genes indicate an activated innate immune signaling repertoire typical of microglia, including
+     Fc-receptor signaling, cytokine responsiveness, and immune phosphatase/kinase modules associated with
+     resident brain macrophages.  
+ 
+  • Lipid-handling and immune-homeostatic microglial program: apoc1, apoeb, csf1rb, mpeg1, ptprc
+     → In addition to core myeloid markers, this cluster expresses conserved microglial lipid-handling and
+     immune-associated genes, including apoc1 and apoeb. This transcriptional profile is consistent with
+     resident CNS microglia engaged in immune surveillance and lipid metabolism rather than peripheral
+     leukocytes.
+ 
+  • Motility and surveillance-associated cytoskeletal machinery: rac2, myo1g, fmnl1a, bin2b, arhgap15, actr2b
+     → These genes support a highly motile, actin-remodeling immune cell state, consistent with the dynamic
+     surveillance behavior of microglia in zebrafish brain tissue.  
+
+**Decision rule:** 
+
+The combined presence of csf1r-pathway genes, irf8/spi1 myeloid regulators, conserved zebrafish microglia markers, and a dominant lysosomal-phagocytic program supports annotation as microglia.  
+
+**Distinguishing note:**
+
+This cluster is distinguished from other glia by its strong immune/phagocytic machinery and from broader peripheral macrophage-like populations by the specific zebrafish microglial signature centered on csf1r dependence, irf8, and conserved resident microglia markers such as apoc1/apoeb.  
+
+mpeg1 = "LOC103034161"
+```{r}
+DotPlot(lSeqGlia, features = c(
+  
+    # Definitive microglial / myeloid identity
+    "csf1ra", "csf1rb", "ptprc", "cd68",
+    "LOC103034161", "lcp1", "coro1a",
+
+    # Microglial lineage TFs
+    "irf8", "spi1a", "mafba", "irf5",
+
+    # Phagocytic / lysosomal program
+    "ctsla", "ctsba", "ctsc", "ctsh", "ctsz",
+    "lgmn", "dnase2", "mcoln1a", "atp6v1ba", "tcirg1b",
+
+    # Immune surveillance / signaling receptors
+    "fcer1g", "tnfrsf1b", "il10rb", "syk", "btk",
+    "inpp5d", "ptpn6", "lyn", "pik3cg",
+
+    # Lipid-handling / immune-homeostatic program
+    "apoc1", "apoeb",
+
+    # Motility / surveillance cytoskeletal machinery
+    "rac2", "myo1g", "fmnl1a", "bin2b", "arhgap15", "actr2b"
+    
+  )
+) + RotatedAxis()
+```
+## Cluster 12: Multiciliated ependymal cells
+
+One-line identity: A mature ventricular ependymal cell population with a FOXJ1-driven motile-cilia program and apical ventricular-surface specialization, consistent with multiciliated ependymal cells rather than radial glia, tanycytes, or generic epithelial cells (Olstad et al., 2019; Pathak et al., 2007; Wang et al., 2022; Xie et al., 2023; Yamaguchi et al., 2018; Zhang et al., 2020).
+ 
+**Key evidence**
+
+  • Definitive multiciliated ependymal program: foxj1b, tp73, dnah1, dnah2, dnah3, dnah5, dnah5l, dnah6,
+  dnah7, dnah9, dnah10, dnah12, dnai1.2, dnai3, rsph1, rsph10b, ccdc39, ccdc40, hydin, tekt1, ttll6, ttll10,
+  cfap45, cfap53, cfap54, cfap57, cfap58, cfap61,cfap65, cfap91, cfap100, cfap221, cfap299, odad1, odad2,
+  odad3, odad4, pacrg, spef2, kif6, kif9, pih1d2
+   →  This cluster is dominated by a large motile-cilia and axoneme assembly program characteristic of
+   multiciliated ependymal cells: foxj1b and tp73 are core regulators of motile ciliogenesis. Further the
+   extensive enrichment of axonemal dyneins (dnah/dnai), radial spoke proteins (rsph), and cilia assembly
+   factors (cfap, ccdc, hydin) strongly supports a mature multiciliated ventricular epithelial identity
+   rather than radial glia or other neural cell types.
+   
+  • Ventricular lining / apical specialization: prom2, pkhd1l1.1, cldn15lb, jupa, cgnl1, stx3b
+   → These genes support a CSF-facing ventricular lining cell rather than a parenchymal glial population.
+ 
+  • Ciliogenesis and basal body machinery: ift172, ift81, ift80, cep genes, bbs genes, rpgrip1l, ofd1
+   → Strong intraflagellar transport and basal body program confirms active and mature cilia assembly,
+   consistent with ependymal cells.
+
+**Decision rule:** 
+
+The overwhelming FOXJ1 / motile-cilia program, combined with ventricular epithelial polarity genes and dorsal ventricular signaling features, supports annotation as multiciliated ependymal epithelium.  
+
+**Distinguishing note:**
+
+This cluster is distinguished from radial glia by its massive motile-cilia structural program and epithelial polarity features, and from immature ependymal / pre-ependymal cells by the breadth and intensity of its mature axonemal gene set. 
+
+```{r}
+DotPlot(lSeqGlia, features = c(
+  
+    # Core FOXJ1 / multiciliated ependymal program
+    "foxj1b", "tp73",
+    "dnah1", "dnah2", "dnah3", "dnah5", "dnah5l", "dnah6",
+    "dnah7", "dnah9", "dnah10", "dnah12",
+    "dnai1.2", "dnai3",
+    "rsph1", "rsph10b",
+    "ccdc39", "ccdc40", "hydin",
+    "tekt1", "ttll6", "ttll10",
+    "cfap45", "cfap53", "cfap54", "cfap57", "cfap58",
+    "cfap61", "cfap65", "cfap91", "cfap100", "cfap221", "cfap299",
+    "odad1", "odad2", "odad3", "odad4",
+    "pacrg", "spef2", "kif6", "kif9", "pih1d2",
+
+    # Ventricular lining / apical specialization
+    "prom2", "pkhd1l1.1", "cldn15lb", "jupa", "cgnl1", "stx3b",
+
+    # Ciliogenesis / basal body machinery
+    "ift172", "ift81", "ift80", "rpgrip1l", "ofd1"
+    
+  )
+) + RotatedAxis()
+```
+# . Label glia object
+## General labels
+Lump radial glia and oligodendrocyte clusters for simplicity
+```{r}
+lSeqGliaGen <- lSeqGlia
+
+# Named vector for relabeling clusters
+cluster_labels <- data.frame(
+  
+  cluster = 0:12,
+  celltype = c(
+    "Radial glia", #0
+    "Radial glia", #1
+    "Astrocytes", #2
+    "Radial glia", #3
+    "Tanycytes", #4
+    "Radial glia", #5
+     "OPCs", #6
+    "Oligodendrocytes", #7
+     "Radial glia", #8
+     "Oligodendrocytes", #9
+    "Microglia", #10
+    "OPCs", #11
+    "Ependymal" #12
+    
+  ))
+
+
+# Convert Idents to numeric or character to match cluster_labels
+cluster_ids <- as.numeric(as.character(Idents(lSeqGliaGen)))
+
+# Join the labels
+lSeqGliaGen$celltype <- cluster_labels$celltype[match(cluster_ids, cluster_labels$cluster)]
+Idents(lSeqGliaGen) <- lSeqGliaGen$celltype
+
+# Order for plotting
+Idents(lSeqGliaGen) <- factor(
+  Idents(lSeqGliaGen),
+  levels = c("Radial glia","Astrocytes","Tanycytes", "OPCs","Oligodendrocytes","Microglia", "Ependymal")
+)
+```
+
+## plot
+```{r}
+p_final <- mini_axis_umap(
+  lSeqGliaGen,
+  reduction = "umap",
+  label = TRUE,
+  shuffle = TRUE,
+  alpha = 0.8,
+  pt.size = 0.5,
+  axis_frac = 0.08,
+  pad_frac  = 0.03
+)
+
+p_final
+# ggsave("lSeqGliaumap.pdf", p_final, width = 10, height = 8, dpi = 300)
+```
+## compositional analysis
+```{r}
+res <- run_prop_glm_and_plot(
+  denom_obj = lSeqGliaGen,
+  group_var = "celltype",
+  glm_family = "auto",
+  bar_error = "sem",
+  overlay_points = TRUE
+)
+
+res$plot_bar
+res$glm_effects
+
+#ggsave("lSeqGliaGenProps_bar.pdf",  res$plot_bar,width = 10, height = 8, dpi = 300)
+#write.csv(res$glm_effects, "lSeqGliaGenProps_glm.csv", row.names =FALSE)
+```
+
+## DEGs for labeled object
+
+```{r}
+pb <- AggregateExpression(
+  lSeqGliaGen,
+  assays        = "RNA",
+  slot          = "counts",
+  group.by      = c("population", "sample_id", "celltype"),
+  return.seurat = TRUE
+)
+
+cts <- GetAssayData(pb, assay = "RNA", layer = "counts")
+
+coldata <- pb@meta.data %>%
+  tibble::rownames_to_column("col_id") %>%     # rownames are the pseudo-bulk column IDs
+  transmute(
+    col_id     = col_id,
+    sample     = sample_id,
+    Population = factor(population, levels = c("surface", "cave")),
+    CellType   = celltype
+  )
+```
+
+
+```{r}
+res <- run_all_celltype_deg_exports(
+  cts = cts,
+  coldata = coldata,
+  padj_cut = 0.05,
+  lfc_min = 0.5,
+  positive_only = TRUE,
+  out_csv = "ST13_GliaCellTypes_MarkerDEGs.csv"
+)
+```
+
+### plot markers
+```{r}
+DotPlot(lSeqGliaGen, features =c(
+
+  # Radial glia
+ # core RG identity
+  "notch1b",
+  "gli3",
+  "ccnd1",
+  "mki67",
+  "axin2",
+  "col18a1a",
+  "cntfr",
+  "LOC103035120",
+  "crb1",
+   "slc38a4",
+  
+  
+  # Astrocytes
+  "glula",
+  "slc1a2b",
+ # "aqp4",
+ # "gpr37l1b",
+  "slc38a3a",
+  "slc7a10a",
+  "slc1a3b","slc6a9","slc6a1b",
+   "megf10","mfge8a",
+   "adcyap1r1b", 
+  
+  
+  
+  # Tanycytes
+  "shha",
+  "npr3",
+  "foxa2",
+  "nkx6.1",
+  "rfx4",
+  "slit3",
+  "spon1b",
+  "ntn1b",
+  "cxcl12a",
+  "bicc2",
+
+  # OPCs
+  "cspg4",
+  "myt1b",
+  "lingo1a",
+  "lingo2",
+  "dscamb",
+  "kcnd2",
+  "grik2",
+  "nrxn2a",
+  "cntnap2a",
+  "slc12a5a",
+
+  # Oligodendrocytes
+  "mbpa",
+  "mbpb",
+  "plp1b",
+  "mag",
+  "sox10",
+  "myrf",
+  "ugt8",
+  "cldnk",
+  "mpz",
+  "bcas1",
+
+  # Microglia
+  "ptprc",
+  "csf1rb",
+  "csf1ra",
+  "spi1b",
+  "apoeb",
+  "inpp5d",
+  "plcg2",
+  "cd68",
+  "lyn",
+  "rac2",
+
+  # Ependymal
+  "tp73",
+  "grhl2b",
+  "cldn7b",
+  "oclnb",
+  "esrp2",
+  "tekt3",
+  "spef1",
+  "dnah3",
+  "dnah5l",
+  "wdr95"
+),
+        dot.scale = 4, scale.min=10, scale.max=80) +
+  theme(panel.background = element_rect(fill="white")) +
+  #ggtitle("markers") +
+  coord_flip() +
+  theme(plot.title = element_text(color="black", size=12, face="plain"),
+        axis.title.x= element_text(size=10),#element_blank(),
+        axis.text.x = element_text(size=10, angle = 45, face="italic"),
+        axis.title.y= element_text(size=10), element_blank(),#
+        axis.text.y = element_text(size=10, angle = 0),
+        legend.title = element_text(size=10),
+        legend.text = element_text(size=10),
+        panel.grid.major = element_line(color = "gray90"),
+        panel.border = element_rect(colour = "black", fill=NA, size=0.5))+
+  ylab('') +
+  theme(axis.line  = element_blank()) +
+  labs(x ="Genes", y = "Cell type")+
+  theme(axis.ticks =element_line(colour = "black", linewidth=0.5)) +
+  scale_colour_gradient(low = "#f2e5ff", high = "#4d0099", limits = c(0,2), oob = scales::squish) +
+  guides(fill = guide_legend(title.position = "left"))
+
+#ggsave("GliaGendottop10.pdf", width = 6, height = 14, dpi = 300)
+```
+
+# . Radial glia
+## label object
+```{r}
+lSeqGliaRG <- lSeqGlia
+
+
+# Named vector for relabeling clusters
+cluster_labels <- data.frame(
+  cluster = 0:12,
+  celltype = c(
+    "rg1", #0 Tectal RG
+    "rg2", #1 Tele RG
+    "other", #2 Astrocytes
+    "rg3", #3 Cerebellar RG
+    "other", #4 Tanycytes
+    "rg4", #5 Ependymal RG
+    "other", #6 OPCs
+    "other", #7 Early OLs
+    "rg5", #8 Hypo RG
+    "other", #9 "Myelinating OLs
+    "other", #10 Microglia
+    "other", #11 OPCs
+    "other" #12 Ependymal
+  )
+)
+
+# Convert Idents to numeric or character to match cluster_labels
+cluster_ids <- as.numeric(as.character(Idents(lSeqGliaRG)))
+
+# Join the labels
+lSeqGliaRG$celltype <- cluster_labels$celltype[match(cluster_ids, cluster_labels$cluster)]
+Idents(lSeqGliaRG) <- lSeqGliaRG$celltype
+
+# reorder for plotting
+Idents(lSeqGliaRG) <- factor(
+  Idents(lSeqGliaRG),
+  levels = c("rg1","rg2","rg3","rg4","rg5","other")
+)
+
+```
+
+## plot
+```{r}
+p_final <- mini_axis_umap(
+  lSeqGliaRG,
+  reduction = "umap",
+  label = TRUE,
+  shuffle = TRUE,
+  alpha = 0.8,
+  pt.size = 0.5,
+  axis_frac = 0.08,
+  pad_frac  = 0.03
+)
+
+p_final
+# ggsave("lSeqGliaumap.pdf", p_final, width = 10, height = 8, dpi = 300)
+```
+## subset to just radial glia
+```{r}
+cells_use <- WhichCells(
+  lSeqGliaRG,
+  idents = setdiff(levels(Idents(lSeqGliaRG)), 
+                   c("other"))
+)
+
+lSeqGliaRG_sub <- subset(
+  lSeqGliaRG,
+  cells = cells_use
+)
+```
+
+### compositional analysis
+```{r}
+res <- run_prop_glm_and_plot(
+  denom_obj = lSeqGliaRG_sub,
+  group_var = "celltype",
+  glm_family = "auto",
+  overdisp_cut = 1.5,
+  bar_error = "sem",
+  overlay_points = TRUE
+)
+
+res$plot_bar
+res$glm_effects
+
+#ggsave("lSeqGliaRG_sub_Props_bySample.pdf", res$plot_bar, width = 10, height = 8, dpi = 300)
+#write.csv(res$glm_effects, "2lSeqGliaRG_sub_glm.csv", row.names = FALSE)
+```
+
+### DEGs
+```{r}
+pb <- AggregateExpression(
+  lSeqGliaRG,
+  assays        = "RNA",
+  slot          = "counts",
+  group.by      = c("population", "sample_id", "celltype"),
+  return.seurat = TRUE
+)
+
+cts <- GetAssayData(pb, assay = "RNA", layer = "counts")
+
+coldata <- pb@meta.data %>%
+  tibble::rownames_to_column("col_id") %>%     # rownames are the pseudo-bulk column IDs
+  transmute(
+    col_id     = col_id,
+    sample     = sample_id,
+    Population = factor(population, levels = c("surface", "cave")),
+    CellType   = celltype
+  )
+```
+
+```{r}
+res <- run_all_celltype_deg_exports(
+  cts = cts,
+  coldata = coldata,
+  padj_cut = 0.05,
+  lfc_min = 0.5,
+  positive_only = TRUE,
+  out_csv = "ST14_RadialGliaSubtypes_MarkerDEGs.csv"
+)
+```
+
+### plot regional markers
+```{r}
+DotPlot(lSeqGliaRG_sub, features = c(
+  
+  # rg1 — Dorsal alar plate
+  "pax7a", "rorb", "zbtb18", "foxn4", "celsr3", "cntn2", "cntnap2b", 
+
+   # rg2 — Telencephalic RG
+  "emx2", "wnt7bb", "id4", "vipr2", "ackr4a", "slitrk2",
+
+  # rg3 — Cerebellar / isthmic RG
+  "fgf8a", "fgf3", "fgf10a", "gbx2", "notum1b", "irx7",
+
+  # rg4 — Ependymal RG
+  "foxj1b", "tppp3", "prom1a", "pacrg", "daw1",
+  "cfap54", "cfap74", "dnah5", "dnah9",
+
+  # rg5 — Hypothalamic RG
+  "shha", "foxa", "foxa2", "heyl"
+  
+
+  )
+) +
+  scale_color_gradient(
+    low = "#f2e5ff",
+  high = "#4d0099",
+  oob = scales::squish,
+     limits = c(0,1),
+  name = "avg.exp"
+) + coord_flip() +
+   #theme(axis.text.x = element_text(angle = 45, hjust = 1) +
+  theme_bw(base_size = 12) 
+ 
+
+#ggsave("RGRegionDot.pdf", width = 8, height = 10, dpi = 300)
+```
+# . Microglia cave vs surface DEGs
+## pseudobulk DEGs
+Aggregate counts (pseudobulk)
+```{r}
+pb <- AggregateExpression(
+  lSeqGliaGen,
+  assays        = "RNA",
+  slot          = "counts",
+  group.by      = c("population", "sample_id", "celltype"),
+  return.seurat = TRUE
+)
+
+cts <- GetAssayData(pb, assay = "RNA", layer = "counts")
+
+coldata <- pb@meta.data %>%
+  tibble::rownames_to_column("col_id") %>%     # rownames are the pseudo-bulk column IDs
+  transmute(
+    col_id     = col_id,
+    sample     = sample_id,
+    Population = factor(population, levels = c("surface", "cave")),
+    CellType   = celltype
+  )
+```
+Deseq2
+```{r}
+micro_out <- deseq2_pb_celltype(cts, coldata, "Microglia", fdr_explore = 0.05)
+
+res_micro <- micro_out$res_all
+dds_micro <- micro_out$dds
+```
+```{r}
+res_df <- res_micro %>%
+  mutate(
+    padj = as.numeric(padj),
+    log2FoldChange_shrunk = as.numeric(log2FoldChange_shrunk),
+    logP = -log10(pmax(padj, .Machine$double.xmin)),  # avoid Inf
+    significance = dplyr::case_when(
+      padj < 0.05 & log2FoldChange_shrunk >  1 ~ "Up in Cave",
+      padj < 0.05 & log2FoldChange_shrunk < -1 ~ "Up in Surface",
+      TRUE ~ "Not significant"
+    )
+  )
+
+ggplot(res_df, aes(x = log2FoldChange, y = logP, color = significance)) +
+  geom_point(alpha = 0.7, size = 3) +
+  scale_color_manual(values = c(
+    "Up in Cave" = "palevioletred",
+    "Up in Surface" = "darkseagreen3",
+    "Not significant" = "lightgray"
+  )) +
+  geom_vline(xintercept = c(-1, 1), linetype = "dashed", color = "gray50") +
+  geom_hline(yintercept = -log10(0.05), linetype = "dashed", color = "gray50") +
+  labs(
+    title = "Volcano Plot: Cave vs Surface (Microglia)",
+    x = "Shrunken log2 Fold Change (Cave vs Surface)",
+    y = "-log10 Adjusted p-value",
+    color = "DE Category"
+  ) +
+  theme_minimal(base_size = 14) +
+  theme(panel.grid.minor = element_blank())
+
+
+#ggsave("microVolc.pdf", width = 10, height = 8, dpi = 300)
+```
+### Make .csv with gene annotations 
+add entrez id column GeneID
+```{r}
+#res_df<- res_df %>% left_join(gene_map, by = c("gene" = "gene_symbol")) 
+#head(res_df)
+```
+
+subset to significant genes
+create output file for DAVID Gene ID Conversion
+```{r}
+## keep only rows marked as significant and map to existing gene annotations
+# sig_res <- res_df %>%
+#   filter(significance != "Not significant") 
+  
+## export entrez IDs to text file
+#write.table(sig_res$GeneID, "microDavid.txt", row.names = FALSE, col.names = FALSE, quote = FALSE)
+```
+import from DAVID
+```{r}
+# # Read Astyanax DAVID file
+# david_asty <- read.delim("microDAVIDnew.txt", sep = "\t", header = TRUE, stringsAsFactors = FALSE)
+# 
+# # Rename column
+# david_asty <- david_asty  %>%
+#   dplyr::rename(GeneID = From) %>%
+#   mutate(GeneID = as.character(GeneID)) 
+# 
+# 
+# # Join to annotated degs to sig_res on GeneID
+# sig_res <- left_join(sig_res , david_asty, by = "GeneID")
+# 
+# # Add unannotatable GeneIDs back in
+# sig_res <- sig_res %>%
+#    mutate(GeneID = as.character(GeneID)) %>%
+#    mutate(final_gene_symbol = case_when(
+#      !is.na(To) ~ To,
+#      !is.na(GeneID) ~ paste0("LOC", GeneID),
+#      TRUE ~ gene)
+#    ) 
+# 
+# # Remove extraneous columns
+# sig_res <- sig_res %>% 
+#   dplyr::select(-c(To)) %>%
+#   dplyr::distinct() #remove duplicated gene rows from ortholog 
+# 
+# 
+# head(sig_res)
+```
+
+write to csv 
+```{r}
+# write.csv(sig_res, file = "micro.de.pseudo.david.csv",
+#               row.names = FALSE)
+```
+
+### volcano plot
+```{r}
+myelPseudo.de.ann <- read.csv("micro.de.pseudo.david.csv")
+```
+
+```{r}
+# assign deg data
+original_deg <- res_df #unannotated/unfiltered
+an_sig_de <- myelPseudo.de.ann #annotated/filtered
+
+# Select only gene and final_gene_symbol from filtered_deg
+original_deg <- original_deg %>%
+  left_join(
+    an_sig_de %>% dplyr::select(gene, final_gene_symbol),
+    by = "gene"
+  ) %>%
+  mutate(final_gene_symbol = if_else(is.na(final_gene_symbol), gene, final_gene_symbol))
+
+
+de.volc<-label_top_genes(original_deg, logfc_thresh = 0)
+
+
+ggplot(de.volc, aes(x = log2FoldChange, y = logP, color = significance)) +
+  geom_point(position = position_jitter(width = 0, height = 0), alpha = 0.7, size = 1.5) +
+  geom_text_repel(
+    aes(label = label),
+    color = "black",
+    size = 3,
+    max.overlaps = 30,
+    segment.color = "black",
+    segment.size = 0.4,
+   # force = 1,                  # push labels away from points
+    min.segment.length = 0      # force drawing of segment even if short
+  ) +
+  scale_color_manual(values = c("Up in Cave" = "palevioletred", "Up in Surface" = "darkseagreen3", "Not significant" = "lightgray")) +
+  geom_vline(xintercept = c(-0.5, 0.5), linetype = "dashed", color = "gray50") +
+  geom_vline(xintercept = 0, linetype = "dashed", color = "gray50") +
+
+   geom_hline(yintercept = -log10(0.05), linetype = "dashed", color = "gray50") +
+  labs(
+    title = "Volcano Plot: Cave vs Surface (Myeloid Mast)",
+    x = "log2 Fold Change (Cave vs Surface)",
+    y = "-log10 Adjusted p-value",
+    color = "DE Category"
+  ) +
+  theme_minimal()
+
+
+#ggsave("MyeloidMastVolc.pdf", width = 10, height = 8, dpi = 300)
+
+```
+
+
+```{r}
+#save variable for downstream plotting
+pseudo_res <- an_sig_de
+```
+
+## cell-level FindMarkers DEGS
+switch to whole data object to use whole brain as background
+```{r}
+# Step 1: Match common cells
+common_cells <- intersect(colnames(lSeq), colnames(lSeqGliaGen))
+# Step 2: Transfer as character to preserve labels
+lSeq$gliacelltypes <- NA_character_
+lSeq$gliacelltypes[common_cells] <- as.character(lSeqGliaGen$celltype[common_cells])
+```
+
+run
+```{r}
+myel.de.sc <- run_celltype_DE_analysis_pop_fm(lSeq, celltype_name = "Microglia")
+```
+
+### write to .csv
+```{r}
+# # keep only rows marked as significant and map to existing gene annotations
+# sig_res <- myel.de.sc %>%
+#   filter(significance != "Not significant") %>%
+#   left_join(gene_map, by = c("gene" = "gene_symbol")) %>%
+#    mutate(GeneID = as.character(GeneID)) 
+#   
+# # export entrez IDs to text file
+# write.table(sig_res$GeneID, "MyeloidMastDavid.txt", row.names = FALSE, col.names = FALSE, quote = FALSE)
+```
+
+import from DAVID
+```{r}
+# #rm(david_asy, sig_res)
+# # Read Astyanax DAVID file
+# david_asty <- read.delim("MyeloidMastDavinew.txt", sep = "\t", header = TRUE, stringsAsFactors = FALSE)
+# 
+# 
+# # Rename column
+# david_asty <- david_asty  %>%
+#   dplyr::rename(GeneID = From) %>%
+#   mutate(To = as.character(To), GeneID = as.character(GeneID)) 
+# 
+# 
+# # Join to annotated degs to sig_res on GeneID
+# sig_res <- left_join(sig_res , david_asty, by = "GeneID")
+# 
+# # Add unannotatable GeneIDs back in
+# sig_res <- sig_res %>%
+#    mutate(GeneID = as.character(GeneID)) %>%
+#    mutate(final_gene_symbol = case_when(
+#      !is.na(To) ~ To,
+#      !is.na(GeneID) ~ paste0("LOC", GeneID),
+#      TRUE ~ gene)
+#    ) 
+# 
+# # Remove extraneous columns
+# sig_res <- sig_res %>% 
+#   dplyr::select(-c(To)) %>%
+#   dplyr::distinct() #remove duplicated gene rows from ortholog 
+# 
+# 
+# head(sig_res)
+```
+
+write to .csv
+```{r}
+# write.csv(sig_res, file = "MicroMastNew.david.csv",
+#               row.names = FALSE)
+```
+
+
+### volcano plots
+zoomed in for comparison
+```{r}
+# Add a -log10(padj) column for plotting
+res_df <- myel.de.sc %>%
+  mutate(
+    logP = -log10(p_val_adj)
+  )
+
+# Volcano plot
+ggplot(res_df, aes(x = avg_log2FC, y = logP, color = significance)) +
+  geom_point(position = position_jitter(width = 0, height = 0), alpha = 0.7, size = 5) +
+  scale_color_manual(values = c(
+    "Up in Cave" = "palevioletred",
+    "Up in Surface" = "darkseagreen3",
+    "Not significant" = "lightgray"
+  )) +
+  geom_vline(xintercept = c(-0.75, 0.75), linetype = "dashed", color = "gray50") +
+  geom_hline(yintercept = -log10(0.05), linetype = "dashed", color = "gray50") +
+ # coord_cartesian(ylim = c(0, 10))+
+   scale_y_break(c(20, 50)) + scale_y_continuous(limits = c(0, 57),breaks = seq(0, 55, by = 5), 55) +
+  labs(
+    title = "Volcano Plot: Cave vs Surface (Myeloid - FMmast)",
+    x = "log2 Fold Change (Cave vs Surface)",
+    y = "-log10 Adjusted p-value",
+    color = "DE Category"
+  ) +
+  theme_minimal(base_size = 14) +
+  theme(
+    legend.position = "right",
+    panel.grid.minor = element_blank()
+  )
+
+#ggsave("microVolcMast.pdf", width = 10, height = 8, dpi = 300)
+```
+labeled
+```{r}
+myelMast.de.ann <- read.csv("MicroMastNew.david.csv")
+
+# assign deg data
+original_deg <- res_df #unannotated/unfiltered
+an_sig_de <- myelMast.de.ann #annotated/filtered
+
+# Select only gene and final_gene_symbol from filtered_deg
+original_deg <- original_deg %>%
+  left_join(
+    an_sig_de %>%
+      dplyr::select(gene, final_gene_symbol) %>%
+      mutate(final_gene_symbol = as.character(final_gene_symbol)),
+    by = "gene"
+  ) %>%
+  mutate(
+    final_gene_symbol = as.character(final_gene_symbol),
+    final_gene_symbol = if_else(
+      is.na(final_gene_symbol),
+      gene,
+      final_gene_symbol
+    )
+  )
+
+de.volc<-label_top_genes_fm(original_deg, logfc_thresh = 0)
+
+
+ggplot(de.volc, aes(x = avg_log2FC, y = logP, color = significance)) +
+  geom_point(position = position_jitter(width = 0, height = 0), alpha = 0.7, size = 1.5) +
+  geom_text_repel(
+    aes(label = label),
+    color = "black",
+    size = 3,
+    max.overlaps = 30,
+    segment.color = "black",
+    segment.size = 0.4,
+   # force = 1,                  # push labels away from points
+    min.segment.length = 0      # force drawing of segment even if short
+  ) +
+  scale_color_manual(values = c("Up in Cave" = "palevioletred", "Up in Surface" = "darkseagreen3", "Not significant" = "lightgray")) +
+  geom_vline(xintercept = c(-0.5, 0.5), linetype = "dashed", color = "gray50") +
+  geom_vline(xintercept = 0, linetype = "dashed", color = "gray50") +
+
+   geom_hline(yintercept = -log10(0.05), linetype = "dashed", color = "gray50") +
+  labs(
+    title = "Volcano Plot: Cave vs Surface (Myeloid Mast)",
+    x = "log2 Fold Change (Cave vs Surface)",
+    y = "-log10 Adjusted p-value",
+    color = "DE Category"
+  ) +
+  theme_minimal()
+
+
+#ggsave("MyeloidMastVolc.pdf", width = 10, height = 8, dpi = 300)
+
+```
+
+### functional deg labels
+```{r}
+## ============================================================
+## Microglia wave I: Pseudobulk vs FindMarkers
+## 3 separate plots:
+##   (1) Venn overlap (non-LOC)
+##   (2) Pseudobulk dotplot (shared genes marked)
+##   (3) FindMarkers-only dotplot (MAST-only; non-shared)
+##
+## Requires objects:
+##   pseudo_res        # DESeq2 results table
+##   myelMast.de.ann   # FindMarkers table
+## ============================================================
+
+stopifnot(exists("pseudo_res"), exists("myelMast.de.ann"))
+
+## ---------------------------
+## Helpers
+## ---------------------------
+is_loc <- function(x) {
+  x <- as.character(x)
+  is.na(x) | x == "" | str_detect(x, regex("^LOC\\d+", ignore_case = TRUE))
+}
+
+assert_all_mapped <- function(df, map_df, gene_col = "gene_label", name = "data") {
+  if (!gene_col %in% names(df)) {
+    stop(sprintf("'%s' column not found in %s. Columns: %s",
+                 gene_col, name, paste(names(df), collapse = ", ")), call. = FALSE)
+  }
+  genes <- unique(as.character(df[[gene_col]]))
+  genes <- genes[!is.na(genes) & genes != ""]
+  missing <- setdiff(genes, unique(as.character(map_df$gene_label)))
+  if (length(missing) > 0) {
+    stop(
+      sprintf(
+        "Functional map incomplete for %s.\nAdd FunctionalGroup labels for:\n%s",
+        name, paste(missing, collapse = ", ")
+      ),
+      call. = FALSE
+    )
+  }
+  invisible(TRUE)
+}
+
+make_dotplot <- function(df, title, group_cols, show_shared_strip = FALSE) {
+
+  df <- df %>%
+    mutate(
+      FunctionalGroup = factor(FunctionalGroup, levels = names(group_cols)),
+      abs_lfc = abs(lfc),
+      neglog10padj = -log10(pmax(padj, .Machine$double.xmin))
+    ) %>%
+    arrange(Group, FunctionalGroup, desc(abs_lfc), padj) %>%
+    mutate(gene_label = factor(gene_label, levels = rev(unique(gene_label))))
+
+  dot_main <- ggplot(df, aes(x = Group, y = gene_label)) +
+    geom_point(aes(size = neglog10padj, colour = abs_lfc), alpha = 0.85) +
+    scale_colour_viridis_c(
+    name   = "|log2FC|",
+    option = "viridis",
+    limits = c(0, 8),
+    oob    = scales::squish
+  ) +
+    scale_size_continuous(name = expression(-log[10](padj))) +
+    labs(title = title, x = NULL, y = NULL) +
+    theme_bw(base_size = 12) +
+    theme(
+      panel.grid.major.x = element_blank(),
+      axis.text.x = element_text(angle = 45, hjust = 1)
+    )
+
+  group_strip <- ggplot(df, aes(x = 1, y = gene_label, fill = FunctionalGroup)) +
+    geom_tile() +
+    scale_fill_manual(values = group_cols, drop = FALSE) +
+    theme_void() +
+    theme(legend.position = "bottom") +
+    xlim(0.5, 1.5)
+
+  if (show_shared_strip) {
+    shared_strip <- ggplot(df, aes(x = 1, y = gene_label, fill = Shared)) +
+      geom_tile() +
+      scale_fill_manual(values = c("Shared" = "black", "Pseudo-only" = "grey90"), drop = FALSE) +
+      theme_void() +
+      theme(legend.position = "none") +
+      xlim(0.5, 1.5)
+
+    dot_main + shared_strip + group_strip +
+      plot_layout(widths = c(4, 0.35, 1.0), guides = "collect") &
+      theme(legend.position = "bottom")
+  } else {
+    dot_main + group_strip +
+      plot_layout(widths = c(4, 1.0), guides = "collect") &
+      theme(legend.position = "bottom")
+  }
+}
+
+## ---------------------------
+## Standardize inputs + remove LOC genes
+## ---------------------------
+pseudo <- pseudo_res %>%
+  mutate(
+    gene_label = as.character(final_gene_symbol),
+    lfc = as.numeric(ifelse(!is.na(log2FoldChange_shrunk), log2FoldChange_shrunk, log2FoldChange)),
+    padj = as.numeric(padj),
+    Group = ifelse(lfc > 0, "Cave", "Surface"),
+    Group = factor(Group, levels = c("Cave", "Surface"))
+  ) %>%
+  filter(!is_loc(gene_label)) %>%
+  mutate(gene_label = str_trim(gene_label)) %>%
+  distinct(gene_label, .keep_all = TRUE)
+
+mast <- myelMast.de.ann %>%
+  mutate(
+    gene_label = coalesce(as.character(final_gene_symbol), as.character(gene)),
+    lfc = as.numeric(avg_log2FC),
+    padj = as.numeric(p_val_adj),
+    Group = case_when(
+      str_detect(significance, regex("cave", ignore_case = TRUE)) ~ "Cave",
+      str_detect(significance, regex("surface", ignore_case = TRUE)) ~ "Surface",
+      TRUE ~ NA_character_
+    ),
+    Group = factor(Group, levels = c("Cave", "Surface"))
+  ) %>%
+  filter(!is.na(Group)) %>%
+  filter(!is_loc(gene_label)) %>%
+  mutate(gene_label = str_trim(gene_label)) %>%
+  distinct(gene_label, Group, .keep_all = TRUE)
+
+## Direction-aware shared genes (same sign direction)
+overlap_all <- union(
+  intersect(pseudo$gene_label[pseudo$Group == "Cave"],    mast$gene_label[mast$Group == "Cave"]),
+  intersect(pseudo$gene_label[pseudo$Group == "Surface"], mast$gene_label[mast$Group == "Surface"])
+)
+
+## ---------------------------
+## Plot 1 — Venn overlap (non-LOC)
+## ---------------------------
+venn_fit <- euler(list(
+  Pseudobulk  = unique(pseudo$gene_label),
+  FindMarkers = unique(mast$gene_label)
+))
+
+# have to manually save because not ggplot
+pdf("Microglia_overlap_venn_nonLOC.pdf", width = 6.5, height = 5.5)
+
+plot(venn_fit, quantities = TRUE, labels = TRUE,
+     main = "Overlap of significant DE genes (non-LOC): Pseudobulk vs FindMarkers")
+
+dev.off()
+
+
+
+## ---------------------------
+## Functional map 
+## ---------------------------
+func_map <- tribble(
+  ~gene_label,  ~FunctionalGroup,
+
+  ## Guidance / developmental patterning / receptor cues
+  "wnt5b",      "Guidance & patterning",
+  "plxnb2a.1",  "Guidance & patterning",
+  "adgrb2",     "Guidance & patterning",
+  "alk",        "Guidance & patterning",
+  "ptprd",      "Guidance & patterning",
+
+  ## ECM / boundary / interface
+  "col4a3",     "ECM & boundary",
+  "itgb7",      "Adhesion & interface",
+  "cldni",      "Adhesion & interface",
+  "mdga2a",     "Adhesion & interface",
+  "pcdh15a",    "Adhesion & interface",
+  "zgc:162952", "Adhesion & interface",
+
+  ## Cytoskeleton / morphology / motility-associated scaffolds
+  "kaznb",      "Cytoskeleton & morphology",
+  "strip2",     "Cytoskeleton & morphology",
+  "sipa1l3",    "Cytoskeleton & morphology",
+  "ank3b",      "Cytoskeleton & morphology",
+
+  ## Immune tone / sensing
+  "nlrc5l",     "Immune tone",
+  "btnl2",      "Immune tone",
+  "trim16l",    "Immune tone",
+  "grk6",       "Immune tone",
+
+  ## Signaling / homeostasis / proteostasis / stress
+  "pde4ba",     "Signaling tone (cAMP/GPCR)",
+  "wnk3",       "Ion/volume homeostasis",
+  "rnft1",      "Proteostasis (ubiquitin)",
+  "trim33l",    "Proteostasis (ubiquitin)",
+  "rnh1",       "Stress/RNA handling",
+
+  ## Immediate early (if present)
+  "fosl2",      "Immediate-early / AP-1",
+
+  ## Developmental pruning / uptake signature
+  "stxbp5a",    "Synaptic material engulfment",
+  "basp1",      "Synaptic material engulfment",
+  "dip2ca",     "Synaptic material engulfment",
+  "dip2ba",     "Synaptic material engulfment",
+  "dlgap3",     "Synaptic material engulfment",
+  "hcn1",       "Synaptic material engulfment",
+
+  ## Retroelement
+  "zferv1",     "Endogenous retroviral activation"
+)
+
+group_cols <- c(
+  "Guidance & patterning"             = "#6366f1",
+  "ECM & boundary"                    = "#fb7185",
+  "Adhesion & interface"              = "#0ea5e9",
+  "Cytoskeleton & morphology"         = "#f59e0b",
+  "Immune tone"                       = "#22c55e",
+  "Signaling tone (cAMP/GPCR)"        = "#7c3aed",
+  "Ion/volume homeostasis"            = "#14b8a6",
+  "Proteostasis (ubiquitin)"          = "#eab308",
+  "Stress/RNA handling"               = "#f97316",
+  "Immediate-early / AP-1"            = "#db2777",
+  "Synaptic material engulfment"      = "#94a3b8",
+  "Endogenous retroviral activation"  = "#ef4444"
+)
+
+## Hard-stop if any plotted gene isn't mapped
+assert_all_mapped(pseudo, func_map, name = "Pseudobulk plotted genes")
+assert_all_mapped(mast,   func_map, name = "FindMarkers plotted genes")
+
+## ---------------------------
+## Plot 2 — Pseudobulk (shared genes marked)
+## ---------------------------
+pseudo_plot <- pseudo %>%
+  left_join(func_map, by = "gene_label") %>%
+  mutate(Shared = ifelse(gene_label %in% overlap_all, "Shared", "Pseudo-only"))
+
+p_pseudo <- make_dotplot(
+  pseudo_plot,
+  title = "Pseudobulk (DESeq2): wave I microglia DE\nShared genes marked",
+  group_cols = group_cols,
+  show_shared_strip = TRUE
+)
+
+p_pseudo
+
+## ---------------------------
+## Plot 3 — FindMarkers ONLY (non-shared / MAST-only)
+## ---------------------------
+mast_only <- mast %>%
+  filter(!gene_label %in% overlap_all) %>%
+  left_join(func_map, by = "gene_label")
+
+assert_all_mapped(mast_only, func_map, name = "FindMarkers-only plotted genes")
+
+p_mast_only <- make_dotplot(
+  mast_only,
+  title = "FindMarkers (MAST): additional cell-level DE (MAST-only; non-shared)",
+  group_cols = group_cols,
+  show_shared_strip = FALSE
+)
+
+p_mast_only
+
+## ---------------------------
+## saves
+## ---------------------------
+ #ggsave("Microglia_Pseudobulk_functional.pdf", p_pseudo, width = 11.5, height = 6.5, dpi = 300)
+ #ggsave("Microglia_FindMarkers_MASTonly_functional.pdf", p_mast_only, width = 11.5, height = 7.5, dpi = 300)
+```
+
+
+# . References
+Akay, L. A., Effenberger, A. H., & Tsai, L. H. (2021). Cell of all trades: Oligodendrocyte precursor cells in synaptic, vascular, and immune
+function. In Genes and Development (Vol. 35, Number 3). https://doi.org/10.1101/GAD.344218.120
+
+Anneser, L., Satou, C., Hotz, H. R., & Friedrich, R. W. (2024). Molecular organization of neuronal cell types and neuromodulatory systems in the zebrafish telencephalon. Current Biology, 34(2). https://doi.org/10.1016/j.cub.2023.12.003
+
+Bai, Q., Parris, R. S., & Burton, E. A. (2014). Different mechanisms regulate expression of zebrafish myelin protein zero (P0) in myelinating oligodendrocytes and its induction following axonal injury. Journal of Biological Chemistry, 289(35). https://doi.org/10.1074/jbc.M113.545426
+
+Bromley-Coolidge, S., Iruegas, D., & Appel, B. (2024). Cspg4 sculpts oligodendrocyte precursor cell morphology. Differentiation, 140. https://doi.org/10.1016/j.diff.2024.100819
+
+Brösamle, C., & Halpern, M. E. (2002). Characterization of myelination in the developing zebrafish. GLIA, 39(1). https://doi.org/10.1002/glia.10088
+
+Ceriani, R., & Whitlock, K. E. (2021). Gonadotropin releasing hormone (Gnrh) triggers neurogenesis in the hypothalamus of adult zebrafish. International Journal of Molecular Sciences, 22(11). https://doi.org/10.3390/ijms22115926
+
+Chen, J., Poskanzer, K. E., Freeman, M. R., & Monk, K. R. (2020). Live-imaging of astrocyte morphogenesis and function in zebrafish neural circuits. Nature Neuroscience, 23(10), 1297–1306. https://doi.org/10.1038/s41593-020-0703-x
+
+Chen, Y., Wu, H., Wang, S., Koito, H., Li, J., Ye, F., Hoang, J., Escobar, S. S., Gow, A., Arnett, H. A., Trapp, B. D., Karandikar, N. J., Hsieh, J., & Lu, Q. R. (2009). The oligodendrocyte-specific G protein-coupled receptor GPR17 is a cell-intrinsic timer of myelination. Nature Neuroscience, 12(11). https://doi.org/10.1038/nn.2410
+
+Collins, H. Y., Doan, R. A., Li, J., Early, J. E., Madden, M. E., Simkins, T., Lyons, D. A., Monk, K. R., & Emery, B. (2025). FBXW7 regulates MYRF levels to control myelin capacity and homeostasis in the adult central nervous system. Nature Communications , 16(1). https://doi.org/10.1038/s41467-025-62715-9
+
+de Oliveira-Carlos, V., Ganz, J., Hans, S., Kaslin, J., & Brand, M. (2013). Notch Receptor Expression in Neurogenic Regions of the Adult Zebrafish Brain. PLoS ONE, 8(9). https://doi.org/10.1371/journal.pone.0073384
+
+D’Gama, P. P., Qiu, T., Cosacak, M. I., Rayamajhi, D., Konac, A., Hansen, J. N., Ringers, C., Acuña-Hinrichsen, F., Hui, S. P., Olstad, E. W., Chong, Y. L., Lim, C. K. A., Gupta, A., Ng, C. P., Nilges, B. S., Kashikar, N. D., Wachten, D., Liebl, D., Kikuchi, K., … Jurisch-Yaksi, N. (2021). Diversity and function of motile ciliated cell types within ependymal lineages of the zebrafish brain. Cell Reports, 37(1). https://doi.org/10.1016/j.celrep.2021.109775
+
+Diotel, N., Rodriguez Viales, R., Armant, O., März, M., Ferg, M., Rastegar, S., & Strähle, U. (2015). Comprehensive expression map of transcription regulators in the adult zebrafish telencephalon reveals distinct neurogenic niches. Journal of Comparative Neurology, 523(8). https://doi.org/10.1002/cne.23733
+
+Diotel, N., Vaillant, C., Gueguen, M. M., Mironov, S., Anglade, I., Servili, A., Pellegrini, E., & Kah, O. (2010). Cxcr4 and Cxcl12 expression in radial glial cells of the brain of adult zebrafish. Journal of Comparative Neurology, 518(24). https://doi.org/10.1002/cne.22492
+
+Duncan, R. N., Xie, Y., McPherson, A. D., Taibi, A. V., Bonkowsky, J. L., Douglass, A. D., & Dorsky, R. I. (2016). Hypothalamic radial glia function as self-renewing neural progenitors in the absence of Wnt/β-catenin signaling. Development (Cambridge), 143(1). https://doi.org/10.1242/dev.126813
+
+Elsen, G. E., Choi, L. Y., Millen, K. J., Grinblat, Y., & Prince, V. E. (2008). Zic1 and Zic4 regulate zebrafish roof plate specification and hindbrain ventricle morphogenesis. Developmental Biology, 314(2). https://doi.org/10.1016/j.ydbio.2007.12.006
+
+Ganz, J., Kaslin, J., Freudenreich, D., Machate, A., Geffarth, M., & Brand, M. (2012). Subdivisions of the adult zebrafish subpallium by molecular marker analysis. Journal of Comparative Neurology, 520(3). https://doi.org/10.1002/cne.22757
+
+Gibbs, H. C., Chang-Gonzalez, A., Hwang, W., Yeh, A. T., & Lekven, A. C. (2017). Midbrain-hindbrain boundary morphogenesis: At the intersection of wnt and Fgf signaling. In Frontiers in Neuroanatomy (Vol. 11). https://doi.org/10.3389/fnana.2017.00064
+
+Grupp, L., Wolburg, H., & Mack, A. F. (2010). Astroglial structures in the zebrafish brain. Journal of Comparative Neurology, 518(21). https://doi.org/10.1002/cne.22481
+Herbomel, P., Thisse, B., & Thisse, C. (2001). Zebrafish early macrophages colonize cephalic mesenchyme and developing brain, retina, and epidermis through a M-CSF receptor-dependent invasive process. Developmental Biology, 238(2). https://doi.org/10.1006/dbio.2001.0393
+
+Hirate, Y., & Okamoto, H. (2006). Canopy1, a novel regulator of FGF signaling around the midbrain-hindbrain boundary in zebrafish. Current Biology, 16(4). https://doi.org/10.1016/j.cub.2006.01.055
+J
+urisch-Yaksi, N., Yaksi, E., & Kizil, C. (2020). Radial glia in the zebrafish brain: Functional, structural, and physiological comparison with the mammalian glia. In GLIA (Vol. 68, Number 12). https://doi.org/10.1002/glia.23849
+
+Kaslin, J., Kroehne, V., Benato, F., Argenton, F., & Brand, M. (2013). Development and specification of cerebellar stem and progenitor cells in zebrafish: From embryo to adult. Neural Development, 8(1). https://doi.org/10.1186/1749-8104-8-9
+
+Kondrychyn, I., Teh, C., Sin, M., & Korzh, V. (2013). Stretching Morphogenesis of the Roof Plate and Formation of the Central Canal. PLoS ONE, 8(2). https://doi.org/10.1371/journal.pone.0056219
+
+Kuhn, S., Gritti, L., Crooks, D., & Dombrowski, Y. (2019). Oligodendrocytes in development, myelin generation and beyond. In Cells (Vol. 8, Number 11). https://doi.org/10.3390/cells8111424
+
+Kuil, L. E., Oosterhof, N., Ferrero, G., Mikulášová, T., Hason, M., Dekker, J., Rovira, M., van der Linde, H. C., van Strien, P. M. H., de Pater, E., Schaaf, G., Bindels, E. M. J., Wittamer, V., & van Ham, T. J. (2020). Zebrafish macrophage developmental arrest underlies depletion of microglia and reveals Csf1r-independent metaphocytes. ELife, 9. https://doi.org/10.7554/eLife.53403
+
+Li, H., Lu, Y., Smith, H. K., & Richardson, W. D. (2007). Olig1 and Sox10 interact synergistically to drive myelin basic protein transcription in oligodendrocytes. Journal of Neuroscience, 27(52). https://doi.org/10.1523/JNEUROSCI.4456-07.2007
+
+Li, J., Miramontes, T. G., Czopka, T., & Monk, K. R. (2024). Synaptic input and Ca2+ activity in zebrafish oligodendrocyte precursor cells contribute to myelin sheath formation. Nature Neuroscience, 27(2). https://doi.org/10.1038/s41593-023-01553-8
+
+Luo, Y., Lu, D., Zhou, J., Wu, J., Wang, W., & Qian, L. (2023). Milk Fat Globule Epidermal Growth Factor 8a Regulates Neurogenesis in Telencephalon and Affects Larval Behavior in Zebrafish. Stem Cells and Development, 32(9–10). https://doi.org/10.1089/scd.2022.0247
+
+Male, I., Tuba Ozacar, A., Fagan, R. R., Loring, M. D., Shen, M. C., Pace, V. A., Devine, C. A., Lawson, G. E., Lutservitz, A., & Karlstrom, R. O. (2020). Hedgehog signaling regulates neurogenesis in the larval and adult zebrafish hypothalamus. ENeuro, 7(6). https://doi.org/10.1523/ENEURO.0226-20.2020
+
+Manoli, M., & Driever, W. (2014). nkx2.1 and nkx2.4 genes function partially redundant during development of the zebrafish hypothalamus, preoptic region, and pallidum. Frontiers in Neuroanatomy, 8(DEC). https://doi.org/10.3389/fnana.2014.00145
+
+Marisca, R., Hoche, T., Agirre, E., Hoodless, L. J., Barkey, W., Auer, F., Castelo-Branco, G., & Czopka, T. (2020). Functionally distinct subgroups of oligodendrocyte precursor cells integrate neural activity and execute myelin formation. Nature Neuroscience, 23(3). https://doi.org/10.1038/s41593-019-0581-2
+
+März, M., Chapouton, P., Diotel, N., Vaillant, C., Hesl, B., Takamiya, M., Lam, C. S., Kah, O., Bally-Cuif, L., & Strähle, U. (2010). Heterogeneity in progenitor cell subtypes in the ventricular zone of the zebrafish adult telencephalon. GLIA, 58(7), 870–888. https://doi.org/10.1002/glia.20971
+
+Mathieu, J., Barth, A., Rosa, F. M., Wilson, S. W., & Peyriéras, N. (2002). Distinct and cooperative roles for Nodal and Hedgehog signals during hypothalamic development. In Development (Vol. 129, Number 13). https://doi.org/10.1242/dev.129.13.3055
+
+Matsunaga, E., Araki, I., & Nakamura, H. (2001). Role of Pax3/7 in the tectum regionalization. Development, 128(20). https://doi.org/10.1242/dev.128.20.4069
+
+Mazzolini, J., Le Clerc, S., Morisse, G., Coulonges, C., Kuil, L. E., van Ham, T. J., Zagury, J. F., & Sieger, D. (2020). Gene expression profiling reveals a conserved microglia signature in larval zebrafish. GLIA, 68(2). https://doi.org/10.1002/glia.23717
+
+Münzel, E. J., Schaefer, K., Obirei, B., Kremmer, E., Burton, E. A., Kuscha, V., Becker, C. G., Brösamle, C., Williams, A., & Becker, T. (2012). Claudin k is specifically expressed in cells that form myelin during development of the nervous system and regeneration of the optic nerve in adult zebrafish. GLIA, 60(2). https://doi.org/10.1002/glia.21260
+
+Norton, W. H., Mangoli, M., Lele, Z., Pogoda, H. M., Diamond, B., Mercurio, S., Russell, C., Teraoka, H., Stickney, H. L., Rauch, G. J., Heisenberg, C. P., Houart, C., Schilling, T. F., Frohnhoefer, H. G., Rastegar, S., Neumann, C. J., Gardiner, R. M., Strähle, U., Geisler, R., … Wilson, S. W. (2005). Monorail/Foxa2 regulates floorplate differentiation and specification of oligodendrocytes, serotonergic raphé neurones and cranial motoneurones. Development, 132(4). https://doi.org/10.1242/dev.01611
+
+Olstad, E. W., Ringers, C., Hansen, J. N., Wens, A., Brandt, C., Wachten, D., Yaksi, E., & Jurisch-Yaksi, N. (2019). Ciliary Beating Compartmentalizes Cerebrospinal Fluid Flow in the Brain and Regulates Ventricular Development. Current Biology, 29(2). https://doi.org/10.1016/j.cub.2018.11.059
+
+Oosterhof, N., Kuil, L. E., van der Linde, H. C., Burm, S. M., Berdowski, W., van Ijcken, W. F. J., van Swieten, J. C., Hol, E. M., Verheijen, M. H. G., & van Ham, T. J. (2018). Colony-Stimulating Factor 1 Receptor (CSF1R) Regulates Microglia Density and Distribution, but Not Microglia Differentiation In Vivo. Cell Reports, 24(5). https://doi.org/10.1016/j.celrep.2018.06.113
+
+Pathak, N., Obara, T., Mangos, S., Liu, Y., & Drummond, I. A. (2007). The zebrafish fleer gene encodes an essential regulator of cilia tubulin polyglutamylation. Molecular Biology of the Cell, 18(11). https://doi.org/10.1091/mbc.E07-06-0537
+
+Peri, F., & Nüsslein-Volhard, C. (2008). Live Imaging of Neuronal Degradation by Microglia Reveals a Role for v0-ATPase a1 in Phagosomal Fusion In Vivo. Cell, 133(5). https://doi.org/10.1016/j.cell.2008.04.037
+
+Pose-Méndez, S., Rehbock, M., Wolf-Asseburg, A., & Köster, R. W. (2024). In Vivo Monitoring of Fabp7 Expression in Transgenic Zebrafish. Cells, 13(13). https://doi.org/10.3390/cells13131138
+
+Pose-Méndez, S., Schramm, P., Valishetti, K., & Köster, R. W. (2023). Development, circuitry, and function of the zebrafish cerebellum. In Cellular and Molecular Life Sciences (Vol. 80, Number 8). https://doi.org/10.1007/s00018-023-04879-5
+
+Ravanelli, A. M., Kearns, C. A., Powers, R. K., Wang, Y., Hines, J. H., Donaldson, M. J., & Appel, B. (2018). Sequential specification of oligodendrocyte lineage cells by distinct levels of Hedgehog and Notch signaling. Developmental Biology, 444(2). https://doi.org/10.1016/j.ydbio.2018.10.004
+
+Ryu, S., & Wolf, A. (2013). Specification of posterior hypothalamic neurons requires coordinated activities of Fezf2, Otp, Sim1a and Foxb1.2. Development (Cambridge), 140(8). https://doi.org/10.1242/dev.085357
+
+Santos-Ledo, A., Pérez-Montes, C., DeOliveira-Mello, L., Arévalo, R., & Velasco, A. (2023). Oligodendrocyte origin and development in the zebrafish visual system. Journal of Comparative Neurology, 531(4). https://doi.org/10.1002/cne.25440
+
+Sedykh, I., Keller, A. N., Yoon, B., Roberson, L., Moskvin, O. V., & Grinblat, Y. (2018). Zebrafish Rfx4 controls dorsal and ventral midline formation in the neural tube. Developmental Dynamics, 247(4). https://doi.org/10.1002/dvdy.24613
+
+Shiau, C. E., Kaufman, Z., Meireles, A. M., & Talbot, W. S. (2015). Differential requirement for irf8 in formation of embryonic and adult macrophages in zebrafish. PLoS ONE, 10(1). https://doi.org/10.1371/journal.pone.0117513
+
+Silva, N. J., Dorman, L. C., Vainchtein, I. D., Horneck, N. C., & Molofsky, A. V. (2021). In situ and transcriptomic identification of microglia in synapse-rich regions of the developing zebrafish brain. Nature Communications, 12(1). https://doi.org/10.1038/s41467-021-26206-x
+
+Sunmonu, N. A., Li, K., Guo, Q., & Li, J. Y. H. (2011). Gbx2 and Fgf8 are sequentially required for formation of the midbrain-hindbrain compartment boundary. Development, 138(4). https://doi.org/10.1242/dev.055665
+
+Takada, N., Kucenas, S., & Appel, B. (2010). Sox10 is necessary for oligodendrocyte survival following axon wrapping. GLIA, 58(8). https://doi.org/10.1002/glia.20981
+
+Thomas, M., Beazley, L., & Ziman, M. (2006). A multiphasic role for Pax7 in tectal development. Experimental Brain Research, 169(2). https://doi.org/10.1007/s00221-005-0335-0
+
+Treichel, A. J., & Hines, J. H. (2018). Development of an Embryonic Zebrafish Oligodendrocyte-Neuron Mixed Coculture System. Zebrafish, 15(6). https://doi.org/10.1089/zeb.2018.1625
+
+Umeda, K., Tanaka, K., Chowdhury, G., Nasu, K., Kuroyanagi, Y., & Yamasu, K. (2024). Evolutionarily conserved roles of foxg1a in the developing subpallium of zebrafish embryos. Development Growth and Differentiation, 66(3). https://doi.org/10.1111/dgd.12917
+
+Viktorin, G., Chiuchitu, C., Rissler, M., Varga, Z. M., & Westerfield, M. (2008). Emx3 is required for the differentiation of dorsal telencephalic neurons. Developmental Dynamics, 238(8). https://doi.org/10.1002/dvdy.22031
+
+Wang, Y., Troutwine, B. R., Zhang, H., & Gray, R. S. (2022). The axonemal dynein heavy chain 10 gene is essential for monocilia motility and spine alignment in zebrafish. Developmental Biology, 482. https://doi.org/10.1016/j.ydbio.2021.12.001
+
+Wong, L., Weadick, C. J., Kuo, C., Chang, B. S., & Tropepe, V. (2010). Duplicate dmbx1 genes regulate progenitor cell cycle and differentiation during zebrafish midbrain and retinal development. BMC Developmental Biology, 10. https://doi.org/10.1186/1471-213X-10-100
+
+Xie, H., Kang, Y., Liu, J., Huang, M., Dai, Z., Shi, J., Wang, S., Li, L., Li, Y., Zheng, P., Sun, Y., Han, Q., Zhang, J., Zhu, Z., Xu, L., Yelick, P. C., Cao, M., & Zhao, C. (2023). Ependymal polarity defects coupled with disorganized ciliary beating drive abnormal cerebrospinal fluid flow and spine curvature in zebrafish. PLoS Biology, 21(3). https://doi.org/10.1371/journal.pbio.3002008
+
+Yamaguchi, H., Oda, T., Kikkawa, M., & Takeda, H. (2018). Systematic studies of all PIH proteins in zebrafish reveal their distinct roles in axonemal dynein assembly. ELife, 7. https://doi.org/10.7554/elife.36979
+
+Yu, S., & He, J. (2019). Stochastic cell-cycle entry and cell-state- dependent fate outputs of injury- reactivated tectal radial glia in zebrafish. ELife, 8. https://doi.org/10.7554/eLife.48660
+
+Zhang, J., Chandrasekaran, G., Li, W., Kim, D. Y., Jeong, I. Y., Lee, S. H., Liang, T., Bae, J. Y., Choi, I., Kang, H., Maeng, J. S., Kim, M. K., Lee, T., Park, S. W., Kim, M. J., Kim, H. S., Ro, H., Bae, Y. C., Park, H. C., … Choi, S. Y. (2020). Wnt-PLC-IP3-Connexin-Ca2+ axis maintains ependymal motile cilia in zebrafish spinal cord. Nature Communications, 11(1). https://doi.org/10.1038/s41467-020-15248-2
+
+
